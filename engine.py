@@ -110,6 +110,8 @@ class DocprocEngine:
                         }
                     ],
                     "temperature": 0.1,
+                    "max_tokens": 6000,
+                    "presence_penalty": 0.2,
                 },
                 timeout=self.config.request_timeout,
             )
