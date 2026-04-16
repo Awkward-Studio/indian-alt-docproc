@@ -27,7 +27,7 @@ def get_engine() -> DocprocEngine:
             vllm_base_url=os.getenv("VLLM_BASE_URL", "http://127.0.0.1:8000/v1"),
             vllm_api_key=os.getenv("VLLM_API_KEY", ""),
             vision_model=os.getenv("VLLM_VISION_MODEL", ""),
-            request_timeout=int(os.getenv("DOCPROC_REQUEST_TIMEOUT", "180")),
+            request_timeout=int(os.getenv("DOCPROC_REQUEST_TIMEOUT", "600")),
             max_page_limit=int(os.getenv("DOCPROC_MAX_PAGE_LIMIT", "200")),
             max_concurrent_ocr=int(os.getenv("DOCPROC_MAX_CONCURRENT_OCR", "3")),
         )
