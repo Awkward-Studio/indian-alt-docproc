@@ -10,8 +10,10 @@ services:
       - ./docproc.env
     ports:
       - "8100:8100"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/health', timeout=5).read()"]
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/health', timeout=5).read()\""]
       interval: 30s
       timeout: 10s
       retries: 5
