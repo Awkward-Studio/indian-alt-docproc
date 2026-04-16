@@ -1,8 +1,13 @@
 services:
   docproc:
+    build:
+      context: .
+      dockerfile: Dockerfile
     image: india-alt-docproc:latest
     container_name: docproc
     restart: unless-stopped
+    env_file:
+      - ./docproc.env
     ports:
       - "8100:8100"
     healthcheck:
