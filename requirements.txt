@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+requests
+pymupdf
+python-pptx
+openpyxl
+python-docx
+extract-msg
