@@ -100,9 +100,14 @@ class DocprocEngine:
         if self.config.vllm_api_key:
             headers["Authorization"] = f"Bearer {self.config.vllm_api_key}"
         
+        # Ensure the base URL correctly includes /v1 for the completions endpoint
+        base_url = self.config.vllm_base_url.rstrip("/")
+        if not base_url.endswith("/v1"):
+            base_url = f"{base_url}/v1"
+            
         with self._ocr_semaphore:
             response = requests.post(
-                f"{self.config.vllm_base_url.rstrip('/')}/chat/completions",
+                f"{base_url}/chat/completions",
                 headers=headers,
                 json={
                     "model": self.config.vision_model,
