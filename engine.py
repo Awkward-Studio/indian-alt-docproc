@@ -28,7 +28,7 @@ class EngineConfig:
     vision_model: str
     request_timeout: int = 600
     max_page_limit: int = 200
-    max_concurrent_ocr: int = 8  # Matched for H100
+    max_concurrent_ocr: int = 8 
 
 class DocprocEngine:
     def __init__(self, config: EngineConfig):
@@ -61,14 +61,11 @@ class DocprocEngine:
             return self._build_result(raw_text="", normalized_text="", quality_flags=["render_failed"], transcription_status="failed")
 
         logger.info(f"[{filename}] Parallelizing {len(images)} pages across {self.config.max_concurrent_ocr} H100 workers...")
-        
         pages_results = [None] * len(images)
         
         def process_page(index, img_b64):
             p_num = index + 1
             start = time.time()
-            logger.info(f"  -> [PAGE {p_num}/{len(images)}] Starting OCR for {filename}...")
-            
             try:
                 text = self._vision_transcribe_page(img_b64, filename=filename, page_number=p_num)
                 elapsed = time.time() - start
@@ -86,21 +83,13 @@ class DocprocEngine:
                 pages_results[idx] = future.result()
 
         full_text = "\n\n".join([p for p in pages_results if p]).strip()
-        logger.info(f"--- FINISHED EXTRACTION: {filename} ---")
-        
-        return self._build_result(
-            raw_text=full_text,
-            normalized_text=full_text,
-            quality_flags=["vision_first", "parallel_ocr"],
-            render_metadata={"page_count": len(images)},
-        )
+        return self._build_result(raw_text=full_text, normalized_text=full_text, quality_flags=["vision_first", "parallel_ocr"], render_metadata={"page_count": len(images)})
 
     def _vision_transcribe_page(self, image_b64: str, *, filename: str, page_number: int) -> str:
         headers = {"Content-Type": "application/json"}
         if self.config.vllm_api_key:
             headers["Authorization"] = f"Bearer {self.config.vllm_api_key}"
         
-        # Ensure the base URL correctly includes /v1 for the completions endpoint
         base_url = self.config.vllm_base_url.rstrip("/")
         if not base_url.endswith("/v1"):
             base_url = f"{base_url}/v1"
@@ -165,20 +154,41 @@ class DocprocEngine:
         return self._merge_extraction_results(rendered, text_export=text_export, route="render_plus_text", fallback_flag="pptx_text_only")
 
     def _extract_xlsx(self, *, file_content: bytes, filename: str, page_limit: int | None) -> dict[str, Any]:
-        sheet_text, sheet_names = self._extract_xlsx_text(file_content, page_limit)
+        # Handle openpyxl crash for old/weird Excel files
+        try:
+            sheet_text, sheet_names = self._extract_xlsx_text(file_content, page_limit)
+        except Exception as e:
+            logger.warning(f"Fast Excel extraction failed for {filename}: {e}. Falling back to full render.")
+            sheet_text, sheet_names = "", []
+
         rendered = self._render_office_to_pdf_and_extract(file_content, filename, page_limit)
-        return self._merge_extraction_results(rendered, text_export=sheet_text, route="render_plus_text", fallback_flag="xlsx_text_only")
+        res = self._merge_extraction_results(rendered, text_export=sheet_text, route="render_plus_text", fallback_flag="xlsx_text_only")
+        if sheet_names:
+            res.setdefault("render_metadata", {})["sheet_names"] = sheet_names
+        return res
 
     def _render_office_to_pdf_and_extract(self, file_content: bytes, filename: str, page_limit: int | None) -> dict[str, Any] | None:
-        if not shutil.which("soffice"): return None
+        if not shutil.which("soffice"): 
+            logger.warning("LibreOffice (soffice) not found in path.")
+            return None
+        ext = os.path.splitext(filename)[1].lower() or ".bin"
         with tempfile.TemporaryDirectory() as temp_dir:
-            in_p = os.path.join(temp_dir, "in" + os.path.splitext(filename)[1])
+            in_p = os.path.join(temp_dir, "in" + ext)
             with open(in_p, "wb") as f: f.write(file_content)
             try:
-                subprocess.run(["soffice", "--headless", "--convert-to", "pdf", "--outdir", temp_dir, in_p], check=True, timeout=120)
-                pdf_p = os.path.join(temp_dir, "in.pdf")
-                with open(pdf_p, "rb") as f: return self._extract_via_vision(file_content=f.read(), filename=filename, page_limit=page_limit)
-            except: return None
+                subprocess.run(["soffice", "--headless", "--convert-to", "pdf", "--outdir", temp_dir, in_p], check=True, timeout=180)
+                pdf_name = "in.pdf"
+                pdf_p = os.path.join(temp_dir, pdf_name)
+                if not os.path.exists(pdf_p):
+                    # Sometimes soffice names it based on input filename
+                    actual_name = os.path.splitext(os.path.basename(in_p))[0] + ".pdf"
+                    pdf_p = os.path.join(temp_dir, actual_name)
+                
+                with open(pdf_p, "rb") as f: 
+                    return self._extract_via_vision(file_content=f.read(), filename=filename, page_limit=page_limit)
+            except Exception as e: 
+                logger.error(f"LibreOffice conversion failed for {filename}: {e}")
+                return None
 
     def _merge_extraction_results(self, rendered, text_export, route, fallback_flag):
         r_text = (rendered or {}).get("normalized_text", "").strip()
@@ -186,17 +196,25 @@ class DocprocEngine:
         if r_text and t_text:
             merged = f"{r_text}\n\n[STRUCTURED EXPORT]\n{t_text}"
             return self._build_result(raw_text=merged, normalized_text=merged, quality_flags=["merged"], render_metadata={"route": route})
-        return self._build_result(raw_text=t_text or r_text, normalized_text=t_text or r_text, quality_flags=[fallback_flag])
+        if r_text:
+            return rendered
+        if t_text:
+            return self._build_result(raw_text=t_text, normalized_text=t_text, quality_flags=[fallback_flag])
+        return self._build_result(raw_text="", normalized_text="", quality_flags=[fallback_flag, "failed"], transcription_status="failed")
 
     @staticmethod
     def _extract_docx_text(file_content: bytes, page_limit: int | None) -> str:
-        doc = Document(io.BytesIO(file_content))
-        return "\n".join([p.text for p in doc.paragraphs if p.text])
+        try:
+            doc = Document(io.BytesIO(file_content))
+            return "\n".join([p.text for p in doc.paragraphs if p.text])
+        except: return ""
 
     @staticmethod
     def _extract_pptx_text(file_content: bytes, page_limit: int | None) -> str:
-        prs = Presentation(io.BytesIO(file_content))
-        return "\n".join([s.shapes[i].text for s in prs.slides for i in range(len(s.shapes)) if hasattr(s.shapes[i], "text")])
+        try:
+            prs = Presentation(io.BytesIO(file_content))
+            return "\n".join([s.shapes[i].text for s in prs.slides for i in range(len(s.shapes)) if hasattr(s.shapes[i], "text")])
+        except: return ""
 
     @staticmethod
     def _extract_xlsx_text(file_content: bytes, page_limit: int | None) -> tuple[str, list[str]]:
