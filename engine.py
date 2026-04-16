@@ -179,7 +179,8 @@ class DocprocEngine:
             in_p = os.path.join(temp_dir, "in" + ext)
             with open(in_p, "wb") as f: f.write(file_content)
             try:
-                subprocess.run(["soffice", "--headless", "--convert-to", "pdf", "--outdir", temp_dir, in_p], check=True, timeout=180)
+                # Increase timeout to 600s for large/complex office documents
+                subprocess.run(["soffice", "--headless", "--convert-to", "pdf", "--outdir", temp_dir, in_p], check=True, timeout=600)
                 pdf_name = "in.pdf"
                 pdf_p = os.path.join(temp_dir, pdf_name)
                 if not os.path.exists(pdf_p):
