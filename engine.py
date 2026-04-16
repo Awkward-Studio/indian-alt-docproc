@@ -28,7 +28,11 @@ class EngineConfig:
     vision_model: str
     request_timeout: int = 600
     max_page_limit: int = 200
-    max_concurrent_ocr: int = 128  # Maximized for H100 96GB 
+    max_concurrent_ocr: int = 4
+    office_render_timeout: int = 120
+    render_docx: bool = False
+    render_pptx: bool = True
+    render_xlsx: bool = False
 
 
 class DocprocEngine:
@@ -148,13 +152,27 @@ class DocprocEngine:
 
     def _extract_docx(self, *, file_content: bytes, filename: str, page_limit: int | None) -> dict[str, Any]:
         text_export = self._extract_docx_text(file_content, page_limit)
-        rendered = self._render_office_to_pdf_and_extract(file_content, filename, page_limit)
-        return self._merge_extraction_results(rendered, text_export=text_export, route="render_plus_text", fallback_flag="docx_text_only")
+        rendered = None
+        if self.config.render_docx:
+            rendered = self._render_office_to_pdf_and_extract(file_content, filename, page_limit)
+        return self._merge_extraction_results(
+            rendered,
+            text_export=text_export,
+            route="render_plus_text" if self.config.render_docx else "text_export_only",
+            fallback_flag="docx_text_only",
+        )
 
     def _extract_pptx(self, *, file_content: bytes, filename: str, page_limit: int | None) -> dict[str, Any]:
         text_export = self._extract_pptx_text(file_content, page_limit)
-        rendered = self._render_office_to_pdf_and_extract(file_content, filename, page_limit)
-        return self._merge_extraction_results(rendered, text_export=text_export, route="render_plus_text", fallback_flag="pptx_text_only")
+        rendered = None
+        if self.config.render_pptx:
+            rendered = self._render_office_to_pdf_and_extract(file_content, filename, page_limit)
+        return self._merge_extraction_results(
+            rendered,
+            text_export=text_export,
+            route="render_plus_text" if self.config.render_pptx else "text_export_only",
+            fallback_flag="pptx_text_only",
+        )
 
     def _extract_xlsx(self, *, file_content: bytes, filename: str, page_limit: int | None) -> dict[str, Any]:
         # Handle openpyxl crash for old/weird Excel files
@@ -164,8 +182,15 @@ class DocprocEngine:
             logger.warning(f"Fast Excel extraction failed for {filename}: {e}. Falling back to full render.")
             sheet_text, sheet_names = "", []
 
-        rendered = self._render_office_to_pdf_and_extract(file_content, filename, page_limit)
-        res = self._merge_extraction_results(rendered, text_export=sheet_text, route="render_plus_text", fallback_flag="xlsx_text_only")
+        rendered = None
+        if self.config.render_xlsx:
+            rendered = self._render_office_to_pdf_and_extract(file_content, filename, page_limit)
+        res = self._merge_extraction_results(
+            rendered,
+            text_export=sheet_text,
+            route="render_plus_text" if self.config.render_xlsx else "text_export_only",
+            fallback_flag="xlsx_text_only",
+        )
         if sheet_names:
             res.setdefault("render_metadata", {})["sheet_names"] = sheet_names
         return res
@@ -179,8 +204,11 @@ class DocprocEngine:
             in_p = os.path.join(temp_dir, "in" + ext)
             with open(in_p, "wb") as f: f.write(file_content)
             try:
-                # Increase timeout to 600s for large/complex office documents
-                subprocess.run(["soffice", "--headless", "--convert-to", "pdf", "--outdir", temp_dir, in_p], check=True, timeout=600)
+                subprocess.run(
+                    ["soffice", "--headless", "--convert-to", "pdf", "--outdir", temp_dir, in_p],
+                    check=True,
+                    timeout=self.config.office_render_timeout,
+                )
                 pdf_name = "in.pdf"
                 pdf_p = os.path.join(temp_dir, pdf_name)
                 if not os.path.exists(pdf_p):
@@ -191,7 +219,7 @@ class DocprocEngine:
                 with open(pdf_p, "rb") as f: 
                     return self._extract_via_vision(file_content=f.read(), filename=filename, page_limit=page_limit)
             except Exception as e: 
-                logger.error(f"LibreOffice conversion failed for {filename}: {e}")
+                logger.warning(f"LibreOffice conversion failed for {filename}: {e}")
                 return None
 
     def _merge_extraction_results(self, rendered, text_export, route, fallback_flag):
@@ -203,7 +231,12 @@ class DocprocEngine:
         if r_text:
             return rendered
         if t_text:
-            return self._build_result(raw_text=t_text, normalized_text=t_text, quality_flags=[fallback_flag])
+            return self._build_result(
+                raw_text=t_text,
+                normalized_text=t_text,
+                quality_flags=[fallback_flag],
+                render_metadata={"route": route},
+            )
         return self._build_result(raw_text="", normalized_text="", quality_flags=[fallback_flag, "failed"], transcription_status="failed")
 
     @staticmethod

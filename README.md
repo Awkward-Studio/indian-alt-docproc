@@ -17,6 +17,10 @@ It is responsible for:
 - `DOCPROC_MAX_PAGE_LIMIT`
 - `DOCPROC_REQUEST_TIMEOUT`
 - `DOCPROC_MAX_CONCURRENT_OCR`
+- `DOCPROC_OFFICE_RENDER_TIMEOUT`
+- `DOCPROC_RENDER_DOCX`
+- `DOCPROC_RENDER_PPTX`
+- `DOCPROC_RENDER_XLSX`
 
 ## Local Run
 
@@ -80,4 +84,6 @@ Response JSON:
 Notes:
 - `docproc` renders and extracts on CPU/RAM; VRAM pressure comes from the OCR calls it makes into local `vLLM`.
 - `DOCPROC_MAX_CONCURRENT_OCR` is the main guardrail that prevents document fanout from flooding the H100 with too many simultaneous vision requests.
+- By default, `DOCX` and `XLSX` use VM-side structured extraction only. `PPTX` keeps render+OCR enabled by default because slide layout matters more.
+- If you want LibreOffice rendering for `DOCX` or `XLSX`, set `DOCPROC_RENDER_DOCX=true` or `DOCPROC_RENDER_XLSX=true`.
 - The main backend should only know `DOC_PROCESSOR_URL`; this service is designed to be deployed independently from the Django app.

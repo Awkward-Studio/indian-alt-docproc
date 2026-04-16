@@ -30,6 +30,10 @@ def get_engine() -> DocprocEngine:
             request_timeout=int(os.getenv("DOCPROC_REQUEST_TIMEOUT", "600")),
             max_page_limit=int(os.getenv("DOCPROC_MAX_PAGE_LIMIT", "200")),
             max_concurrent_ocr=int(os.getenv("DOCPROC_MAX_CONCURRENT_OCR", "3")),
+            office_render_timeout=int(os.getenv("DOCPROC_OFFICE_RENDER_TIMEOUT", "120")),
+            render_docx=os.getenv("DOCPROC_RENDER_DOCX", "false").lower() == "true",
+            render_pptx=os.getenv("DOCPROC_RENDER_PPTX", "true").lower() == "true",
+            render_xlsx=os.getenv("DOCPROC_RENDER_XLSX", "false").lower() == "true",
         )
     )
 
@@ -43,6 +47,10 @@ def health() -> dict:
         "vision_model": engine.config.vision_model,
         "max_page_limit": engine.config.max_page_limit,
         "max_concurrent_ocr": engine.config.max_concurrent_ocr,
+        "office_render_timeout": engine.config.office_render_timeout,
+        "render_docx": engine.config.render_docx,
+        "render_pptx": engine.config.render_pptx,
+        "render_xlsx": engine.config.render_xlsx,
     }
 
 
