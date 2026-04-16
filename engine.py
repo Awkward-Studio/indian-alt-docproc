@@ -28,7 +28,7 @@ class EngineConfig:
     vision_model: str
     request_timeout: int = 600
     max_page_limit: int = 200
-    max_concurrent_ocr: int = 64  # Maximized for H100 
+    max_concurrent_ocr: int = 128  # Maximized for H100 96GB 
 
 
 class DocprocEngine:
