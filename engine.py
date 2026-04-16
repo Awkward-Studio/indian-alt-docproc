@@ -28,7 +28,8 @@ class EngineConfig:
     vision_model: str
     request_timeout: int = 600
     max_page_limit: int = 200
-    max_concurrent_ocr: int = 8 
+    max_concurrent_ocr: int = 16  # Maximized for H100 
+
 
 class DocprocEngine:
     def __init__(self, config: EngineConfig):
