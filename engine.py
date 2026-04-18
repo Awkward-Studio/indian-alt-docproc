@@ -10,7 +10,7 @@ import time
 import gc
 import json
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Generator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import fitz  # PyMuPDF
@@ -42,34 +42,30 @@ class DocprocEngine:
         self._ocr_semaphore = threading.BoundedSemaphore(max(1, config.max_concurrent_ocr))
 
     def extract_document(self, *, file_content: bytes, filename: str, page_limit: int | None = None) -> dict[str, Any]:
+        """Legacy non-streaming entry point, now uses the sliding window logic."""
         ext = os.path.splitext(filename)[1].lower()
         limit = min(page_limit, self.config.max_page_limit) if page_limit else self.config.max_page_limit
         
         logger.info(f"--- START EXTRACTION: {filename} ---")
-
         try:
             if ext in {".png", ".jpg", ".jpeg", ".pdf"}:
                 return self._extract_via_vision(file_content=file_content, filename=filename, page_limit=limit)
             
-            # OFFICE SPEED OPTIMIZATION: Try direct text extraction first
+            # Office Speed Path
             text_export = ""
             if ext in {".docx", ".doc"}: text_export = self._extract_docx_text(file_content, limit)
             elif ext in {".pptx", ".ppt"}: text_export = self._extract_pptx_text(file_content, limit)
             elif ext in {".xlsx", ".xls"}: 
                 try: text_export, _ = self._extract_xlsx_text(file_content, limit)
-                except: text_export = ""
+                except: pass
 
-            # If it's a small file and we got text, skip the expensive rendering to save H100 time
-            if len(file_content) < 1024 * 50 and text_export.strip(): # < 50KB
-                logger.info(f"Using fast direct extraction for small office file: {filename}")
-                return self._build_result(raw_text=text_export, normalized_text=text_export, quality_flags=["direct_text_only"])
+            if len(file_content) < 51200 and text_export.strip():
+                return self._build_result(raw_text=text_export, normalized_text=text_export, quality_flags=["direct_text"])
 
-            # Otherwise, do the full render + merge
             rendered = self._render_office_to_pdf_and_extract(file_content, filename, limit)
             return self._merge_extraction_results(rendered, text_export=text_export, route="render_plus_text", fallback_flag=f"{ext}_text_only")
-
         except Exception as e:
-            logger.exception(f"Critical failure for {filename}")
+            logger.exception(f"Failure for {filename}")
             return self._build_result(raw_text="", normalized_text="", quality_flags=["crash"], error=str(e), transcription_status="failed")
 
     def _extract_via_vision(self, *, file_content: bytes, filename: str, page_limit: int | None) -> dict[str, Any]:
@@ -85,8 +81,8 @@ class DocprocEngine:
                 limit = min(page_limit, len(doc)) if page_limit else len(doc)
                 logger.info(f"[{filename}] Sliding window for {limit} pages...")
                 
-                # Window size of 50 to match local chunks and maximize H100 saturation
-                window_size = 50
+                # Maximized window size for H100
+                window_size = 64
                 for start_idx in range(0, limit, window_size):
                     end_idx = min(start_idx + window_size, limit)
                     batch_images = []
@@ -179,7 +175,9 @@ class DocprocEngine:
         if r_text and t_text:
             merged = f"{r_text}\n\n[STRUCTURED EXPORT]\n{t_text}"
             return self._build_result(raw_text=merged, normalized_text=merged, quality_flags=["merged"], render_metadata={"route": route})
-        return self._build_result(raw_text=t_text or r_text, normalized_text=t_text or r_text, quality_flags=[fallback_flag])
+        if r_text: return rendered
+        if t_text: return self._build_result(raw_text=t_text, normalized_text=t_text, quality_flags=[fallback_flag])
+        return self._build_result(raw_text="", normalized_text="", quality_flags=[fallback_flag, "failed"], transcription_status="failed")
 
     @staticmethod
     def _extract_docx_text(file_content: bytes, page_limit: int | None) -> str:
