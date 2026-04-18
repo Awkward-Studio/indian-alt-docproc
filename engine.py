@@ -43,7 +43,7 @@ class DocprocEngine:
 
     def stream_extract(self, *, file_content: bytes, filename: str, page_limit: int | None = None) -> Generator[str, None, None]:
         """Generator that sends heartbeat spaces to keep the network connection alive."""
-        ext = os.path.splitext(filename).lower()
+        ext = os.path.splitext(filename)[1].lower()
         
         # Start the conversion in a separate thread so we can send heartbeats
         result_container = {}
