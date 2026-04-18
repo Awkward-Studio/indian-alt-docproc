@@ -32,6 +32,7 @@ class EngineConfig:
     max_page_limit: int = 500
     max_concurrent_ocr: int = 96
     office_render_timeout: int = 600
+    sliding_window_size: int = 50
     render_xlsx: bool = True
     render_docx: bool = True
     render_pptx: bool = True
@@ -43,8 +44,6 @@ class DocprocEngine:
 
     def stream_extract(self, *, file_content: bytes, filename: str, page_limit: int | None = None) -> Generator[str, None, None]:
         """Generator that sends heartbeat spaces to keep the network connection alive."""
-        ext = os.path.splitext(filename)[1].lower()
-        
         # Start the conversion in a separate thread so we can send heartbeats
         result_container = {}
         stop_heartbeat = threading.Event()
@@ -64,20 +63,18 @@ class DocprocEngine:
         thread = threading.Thread(target=run_extraction)
         thread.start()
 
-        # Send heartbeats (spaces) while the thread is working
         while not stop_heartbeat.is_set():
-            yield " "  # Send a single space byte
+            yield " " 
             time.sleep(5)
 
         thread.join()
-
-        # Final check for error or data
         if 'error' in result_container:
             yield json.dumps({"error": result_container['error'], "status": "failed"})
         else:
             yield json.dumps(result_container.get('data', {}))
 
     def extract_document(self, *, file_content: bytes, filename: str, page_limit: int | None = None) -> dict[str, Any]:
+        """Entry point for extraction."""
         ext = os.path.splitext(filename)[1].lower()
         limit = min(page_limit, self.config.max_page_limit) if page_limit else self.config.max_page_limit
         
@@ -115,7 +112,9 @@ class DocprocEngine:
             with fitz.open(stream=file_content, filetype="pdf") as doc:
                 limit = min(page_limit, len(doc)) if page_limit else len(doc)
                 logger.info(f"[{filename}] Sliding window for {limit} pages...")
-                window_size = 64
+                
+                # TUNABLE KNOB: window_size
+                window_size = self.config.sliding_window_size
                 for start_idx in range(0, limit, window_size):
                     end_idx = min(start_idx + window_size, limit)
                     batch_images = []
@@ -138,7 +137,9 @@ class DocprocEngine:
                     batch_images.clear()
                     gc.collect()
                     logger.info(f"  Progress: {len(pages_results)}/{limit}")
+
         except Exception as e:
+            logger.error(f"PDF failed: {e}")
             return self._build_result(raw_text="", normalized_text="", quality_flags=["failed"], error=str(e))
 
         full_text = "\n\n".join([p for p in pages_results if p]).strip()
@@ -148,6 +149,7 @@ class DocprocEngine:
         headers = {"Content-Type": "application/json"}
         if self.config.vllm_api_key:
             headers["Authorization"] = f"Bearer {self.config.vllm_api_key}"
+        
         base_url = self.config.vllm_base_url.rstrip("/")
         if not base_url.endswith("/v1"): base_url = f"{base_url}/v1"
             
@@ -231,7 +233,7 @@ class DocprocEngine:
             for name in wb.sheetnames:
                 res.append(f"--- {name} ---\n" + "\n".join(["\t".join([str(c) if c else "" for c in r]) for r in wb[name].iter_rows(values_only=True)]))
             return "\n".join(res), wb.sheetnames
-        except: return "", []
+        except: return ""
 
     @staticmethod
     def _build_result(*, raw_text: str, normalized_text: str, quality_flags: list[str], render_metadata: dict = None, transcription_status="complete", error=None) -> dict:
