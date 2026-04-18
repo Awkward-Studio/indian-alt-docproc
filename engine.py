@@ -42,7 +42,7 @@ class DocprocEngine:
         self._ocr_semaphore = threading.BoundedSemaphore(max(1, config.max_concurrent_ocr))
 
     def extract_document(self, *, file_content: bytes, filename: str, page_limit: int | None = None) -> dict[str, Any]:
-        """Legacy non-streaming entry point, now uses the sliding window logic."""
+        """Entry point for extraction."""
         ext = os.path.splitext(filename)[1].lower()
         limit = min(page_limit, self.config.max_page_limit) if page_limit else self.config.max_page_limit
         
@@ -81,7 +81,7 @@ class DocprocEngine:
                 limit = min(page_limit, len(doc)) if page_limit else len(doc)
                 logger.info(f"[{filename}] Sliding window for {limit} pages...")
                 
-                # Maximized window size for H100
+                # GLOBAL SYNC: Always use 64 for H100
                 window_size = 64
                 for start_idx in range(0, limit, window_size):
                     end_idx = min(start_idx + window_size, limit)
