@@ -76,7 +76,9 @@ class DocprocEngine:
     def extract_document(self, *, file_content: bytes, filename: str, page_limit: int | None = None) -> dict[str, Any]:
         """Entry point for extraction."""
         ext = os.path.splitext(filename)[1].lower()
-        limit = min(page_limit, self.config.max_page_limit) if page_limit else self.config.max_page_limit
+        
+        # Priority: Request Limit > Centralized Default Limit
+        limit = page_limit if page_limit else self.config.max_page_limit
         
         logger.info(f"--- START EXTRACTION: {filename} ---")
         try:
