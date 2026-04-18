@@ -16,7 +16,7 @@ services:
       uvicorn main:app
       --host 0.0.0.0
       --port 8100
-      --workers 4
+      --workers 12
       --h11-max-incomplete-event-size 524288000
       --timeout-keep-alive 600
       --timeout-graceful-shutdown 600
