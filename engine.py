@@ -85,8 +85,8 @@ class DocprocEngine:
                 limit = min(page_limit, len(doc)) if page_limit else len(doc)
                 logger.info(f"[{filename}] Sliding window for {limit} pages...")
                 
-                # Window size of 16 to keep H100 busy but VM RAM safe
-                window_size = 16
+                # Window size of 50 to match local chunks and maximize H100 saturation
+                window_size = 50
                 for start_idx in range(0, limit, window_size):
                     end_idx = min(start_idx + window_size, limit)
                     batch_images = []
