@@ -30,7 +30,7 @@ class EngineConfig:
     vision_model: str
     request_timeout: int = 600
     max_page_limit: int = 500
-    max_concurrent_ocr: int = 128
+    max_concurrent_ocr: int = 96
     office_render_timeout: int = 600
     render_xlsx: bool = True
     render_docx: bool = True
