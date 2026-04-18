@@ -4,6 +4,7 @@ import logging
 import os
 
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from engine import DocprocEngine, EngineConfig
@@ -27,7 +28,7 @@ def get_engine():
             vision_model=os.getenv("VLLM_VISION_MODEL", ""),
             request_timeout=int(os.getenv("DOCPROC_REQUEST_TIMEOUT", "600")),
             max_page_limit=int(os.getenv("DOCPROC_MAX_PAGE_LIMIT", "500")),
-            max_concurrent_ocr=int(os.getenv("DOCPROC_MAX_CONCURRENT_OCR", "128")),
+            max_concurrent_ocr=int(os.getenv("DOCPROC_MAX_CONCURRENT_OCR", "96")),
             office_render_timeout=int(os.getenv("DOCPROC_OFFICE_RENDER_TIMEOUT", "600")),
             render_xlsx=os.getenv("DOCPROC_RENDER_XLSX", "true").lower() == "true",
             render_docx=os.getenv("DOCPROC_RENDER_DOCX", "true").lower() == "true",
@@ -39,44 +40,32 @@ def get_engine():
 def health():
     try:
         engine = get_engine()
-        return {
-            "status": "ok",
-            "vllm_base_url": engine.config.vllm_base_url,
-            "vision_model": engine.config.vision_model,
-            "max_page_limit": engine.config.max_page_limit,
-            "max_concurrent_ocr": engine.config.max_concurrent_ocr,
-            "office_render_timeout": engine.config.office_render_timeout,
-            "render_docx": engine.config.render_docx,
-            "render_pptx": engine.config.render_pptx,
-            "render_xlsx": engine.config.render_xlsx,
-        }
+        return {"status": "ok", "max_concurrent_ocr": engine.config.max_concurrent_ocr}
     except Exception as e:
-        logger.exception("Health check failed")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/extract/document")
-def extract_document(
+async def extract_document(
     request: ExtractDocumentRequest,
     authorization: str | None = Header(default=None),
 ):
     expected_api_key = os.getenv("DOCPROC_API_KEY", "")
-    if expected_api_key:
-        if authorization != f"Bearer {expected_api_key}":
-            raise HTTPException(status_code=401, detail="Unauthorized")
+    if expected_api_key and authorization != f"Bearer {expected_api_key}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
+    engine = get_engine()
     try:
-        engine = get_engine()
-        # Decode the file in memory
-        try:
-            file_content = base64.b64decode(request.content_base64)
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid base64 content")
+        file_content = base64.b64decode(request.content_base64)
+    except:
+        raise HTTPException(status_code=400, detail="Invalid base64")
 
-        return engine.extract_document(
+    # We return a StreamingResponse so we can send "Keep-Alive" heartbeats 
+    # during long LibreOffice conversions.
+    return StreamingResponse(
+        engine.stream_extract(
             file_content=file_content,
             filename=request.filename,
             page_limit=request.page_limit,
-        )
-    except Exception as e:
-        logger.exception("Document extraction failed for %s", request.filename)
-        raise HTTPException(status_code=500, detail=str(e))
+        ),
+        media_type="application/x-ndjson"
+    )
