@@ -12,6 +12,14 @@ services:
       - "8100:8100"
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    command: >
+      uvicorn main:app
+      --host 0.0.0.0
+      --port 8100
+      --workers 4
+      --h11-max-incomplete-event-size 524288000
+      --timeout-keep-alive 600
+      --timeout-graceful-shutdown 600
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/health', timeout=5).read()\""]
       interval: 30s
