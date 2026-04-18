@@ -18,6 +18,7 @@ class ExtractDocumentRequest(BaseModel):
     filename: str
     content_base64: str
     page_limit: int | None = None
+    start_page: int | None = 0
 
 @lru_cache()
 def get_engine():
@@ -28,9 +29,11 @@ def get_engine():
             vision_model=os.getenv("VLLM_VISION_MODEL", ""),
             request_timeout=int(os.getenv("DOCPROC_REQUEST_TIMEOUT", "600")),
             max_page_limit=int(os.getenv("DOCPROC_MAX_PAGE_LIMIT", "500")),
-            max_concurrent_ocr=int(os.getenv("DOCPROC_MAX_CONCURRENT_OCR", "96")),
+            max_concurrent_ocr=int(os.getenv("DOCPROC_MAX_CONCURRENT_OCR", "128")),
             office_render_timeout=int(os.getenv("DOCPROC_OFFICE_RENDER_TIMEOUT", "600")),
+            sliding_window_size=int(os.getenv("DOCPROC_SLIDING_WINDOW_SIZE", "64")),
             render_xlsx=os.getenv("DOCPROC_RENDER_XLSX", "true").lower() == "true",
+
             render_docx=os.getenv("DOCPROC_RENDER_DOCX", "true").lower() == "true",
             render_pptx=os.getenv("DOCPROC_RENDER_PPTX", "true").lower() == "true",
         )
