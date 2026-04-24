@@ -229,13 +229,48 @@ class DocprocEngine:
 
     @staticmethod
     def _extract_xlsx_text(file_content: bytes, page_limit: int | None) -> tuple[str, list[str]]:
+        """
+        High-fidelity Excel extraction.
+        Converts sheets to Markdown tables for optimal LLM consumption.
+        """
         try:
-            wb = load_workbook(io.BytesIO(file_content), data_only=True, read_only=True)
+            import pandas as pd
+            # Use pandas for industrial-grade table parsing
+            excel_file = io.BytesIO(file_content)
+            # Read all sheets
+            all_sheets = pd.read_excel(excel_file, sheet_name=None, engine='openpyxl')
+            
             res = []
-            for name in wb.sheetnames:
-                res.append(f"--- {name} ---\n" + "\n".join(["\t".join([str(c) if c else "" for c in r]) for r in wb[name].iter_rows(values_only=True)]))
-            return "\n".join(res), wb.sheetnames
-        except: return ""
+            sheet_names = []
+            
+            for name, df in all_sheets.items():
+                sheet_names.append(name)
+                if df.empty:
+                    continue
+                
+                # Clean up: remove entirely empty rows/columns to save tokens
+                df = df.dropna(how='all').dropna(axis=1, how='all')
+                if df.empty:
+                    continue
+
+                res.append(f"### SHEET: {name}")
+                # Convert to high-contrast Markdown table
+                res.append(df.to_markdown(index=False))
+                res.append("\n")
+
+            return "\n\n".join(res), sheet_names
+        except Exception as e:
+            logger.warning(f"Advanced Excel extraction failed, using basic fallback: {e}")
+            try:
+                # Basic fallback if pandas fails
+                from openpyxl import load_workbook
+                wb = load_workbook(io.BytesIO(file_content), data_only=True, read_only=True)
+                res = []
+                for name in wb.sheetnames:
+                    res.append(f"--- {name} ---\n" + "\n".join(["\t".join([str(c) if c else "" for c in r]) for r in wb[name].iter_rows(values_only=True)]))
+                return "\n".join(res), wb.sheetnames
+            except:
+                return "", []
 
     @staticmethod
     def _build_result(*, raw_text: str, normalized_text: str, quality_flags: list[str], render_metadata: dict = None, transcription_status="complete", error=None) -> dict:
