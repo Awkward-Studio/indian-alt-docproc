@@ -81,47 +81,68 @@ class DocprocEngine:
         # Priority: Request Limit > Centralized Default Limit
         limit = page_limit if page_limit else self.config.max_page_limit
         
-        logger.info(f"--- START EXTRACTION: {filename} ---")
+        logger.info(f"--- START EXTRACTION: {filename} (Ext: {ext}) ---")
         try:
             if ext in {".png", ".jpg", ".jpeg", ".pdf"}:
+                logger.info(f"[{filename}] Using Vision Path (Direct/Sliding Window)")
                 return self._extract_via_vision(file_content=file_content, filename=filename, page_limit=limit, hint=hint)
             
             # Office Speed Path
             text_export = ""
             should_render = True
             
-            if ext in {".docx", ".doc"}: 
+            # 1. DOCX Path
+            if ext in {".docx", ".doc", ".odt"}: 
+                logger.info(f"[{filename}] Attempting Word/Doc text extraction...")
                 text_export = self._extract_docx_text(file_content, limit)
                 should_render = self.config.render_docx
-            elif ext in {".pptx", ".ppt"}: 
+                logger.info(f"[{filename}] Word extraction complete. Chars: {len(text_export)}, should_render: {should_render}")
+
+            # 2. PPTX Path
+            elif ext in {".pptx", ".ppt", ".odp"}: 
+                logger.info(f"[{filename}] Attempting PowerPoint/Slides text extraction...")
                 text_export = self._extract_pptx_text(file_content, limit)
                 should_render = self.config.render_pptx
-            elif ext in {".xlsx", ".xls"}: 
-                try: 
-                    text_export, _ = self._extract_xlsx_text(file_content, limit)
-                except Exception as e:
-                    logger.error(f"Top-level Excel extraction error: {e}")
-                
-                # STRENGTHENED: Excel is never rendered unless explicitly requested AND text failed
-                should_render = self.config.render_xlsx and not text_export.strip()
-                if not should_render:
-                    logger.info(f"Excel rendering is disabled or text extraction succeeded. Staying on text path.")
+                logger.info(f"[{filename}] PowerPoint extraction complete. Chars: {len(text_export)}, should_render: {should_render}")
 
-            # 1. If we got text and we aren't supposed to render, return immediately (BYPASS SIZE LIMIT)
+            # 3. Excel/Tabular Path (STRENGTHENED)
+            elif ext in {".xlsx", ".xls", ".xlsm", ".xlsb", ".csv", ".ods"}: 
+                logger.info(f"[{filename}] Attempting Excel/Tabular text extraction...")
+                try: 
+                    text_export, _ = self._extract_xlsx_text(file_content, limit, filename=filename)
+                except Exception as e:
+                    logger.error(f"[{filename}] Top-level Excel extraction error: {e}")
+                
+                # STRICT: If render_xlsx is False, we NEVER render, regardless of text success
+                if not self.config.render_xlsx:
+                    should_render = False
+                    logger.info(f"[{filename}] Excel rendering is EXPLICITLY DISABLED. Proceeding with text only.")
+                else:
+                    # If rendering is allowed, only do it if text extraction completely failed
+                    should_render = not text_export.strip()
+                    logger.info(f"[{filename}] Excel text extraction result: {len(text_export)} chars. should_render set to {should_render}")
+
+            # Final Decision Logic
             if text_export.strip() and not should_render:
+                logger.info(f"[{filename}] SUCCESS: Returning direct text (Rendering disabled or unnecessary).")
                 return self._build_result(raw_text=text_export, normalized_text=text_export, quality_flags=["direct_text", "no_render"])
 
-            # 2. If it's a small file and we got text, return immediately
             if text_export.strip() and len(file_content) < 51200:
+                logger.info(f"[{filename}] SUCCESS: Returning direct text (Small file optimization).")
                 return self._build_result(raw_text=text_export, normalized_text=text_export, quality_flags=["direct_text", "small_file"])
 
-            # 3. If rendering is disabled and text failed, return failure instead of rendering
             if not should_render and not text_export.strip():
+                logger.warning(f"[{filename}] FAILED: Text extraction failed and rendering is disabled.")
                 return self._build_result(raw_text="", normalized_text="", quality_flags=["failed_text_no_render"], error="Text extraction failed and rendering is disabled for this type")
 
             # 4. Fallback to rendering (PDF + Vision)
-            logger.info(f"Falling back to rendering path for {filename} (should_render={should_render})")
+            logger.info(f"[{filename}] FALLBACK: Falling back to rendering path (should_render={should_render})")
             rendered = self._render_office_to_pdf_and_extract(file_content, filename, limit, hint=hint)
+            if rendered:
+                logger.info(f"[{filename}] Rendering success. Merging results.")
+            else:
+                logger.warning(f"[{filename}] Rendering failed (LibreOffice error).")
+            
             return self._merge_extraction_results(rendered, text_export=text_export, route="render_plus_text", fallback_flag=f"{ext}_text_only")
         except Exception as e:
             logger.exception(f"Failure for {filename}")
@@ -256,19 +277,36 @@ class DocprocEngine:
         except: return ""
 
     @staticmethod
-    def _extract_xlsx_text(file_content: bytes, page_limit: int | None) -> tuple[str, list[str]]:
+    def _extract_xlsx_text(file_content: bytes, page_limit: int | None, filename: str = "") -> tuple[str, list[str]]:
         """
-        High-fidelity Excel extraction.
+        High-fidelity Excel/CSV extraction.
         Converts sheets to Markdown tables for optimal LLM consumption.
         """
-        filename_hint = "Excel File"
+        ext = os.path.splitext(filename)[1].lower() if filename else ""
         try:
             import pandas as pd
-            # Use pandas for industrial-grade table parsing
             excel_file = io.BytesIO(file_content)
-            # Read all sheets
-            logger.info(f"Attempting pandas extraction for Excel...")
-            all_sheets = pd.read_excel(excel_file, sheet_name=None, engine='openpyxl')
+            
+            # Special Case: CSV
+            if ext == ".csv":
+                logger.info(f"Attempting pandas CSV extraction...")
+                df = pd.read_csv(excel_file)
+                if df.empty: return "", []
+                df = df.dropna(how='all').dropna(axis=1, how='all')
+                text_out = df.to_markdown(index=False)
+                return text_out, ["CSV_Sheet"]
+
+            # Standard Excel Path
+            logger.info(f"Attempting pandas extraction for Excel ({ext})...")
+            # engine='openpyxl' supports xlsx, xlsm, xltx, xltm. 
+            # engine='pyxlsb' for xlsb. 
+            # engine='xlrd' for old xls.
+            
+            engine = 'openpyxl'
+            if ext == ".xlsb": engine = 'pyxlsb'
+            elif ext == ".xls": engine = 'xlrd'
+
+            all_sheets = pd.read_excel(excel_file, sheet_name=None, engine=engine)
             
             res = []
             sheet_names = []
@@ -298,7 +336,7 @@ class DocprocEngine:
         except Exception as e:
             logger.error(f"Advanced pandas Excel extraction failed: {e}")
             try:
-                # Basic fallback if pandas fails
+                # Basic fallback if pandas fails (openpyxl only supports modern XML formats)
                 logger.info("Attempting openpyxl read_only fallback...")
                 from openpyxl import load_workbook
                 wb = load_workbook(io.BytesIO(file_content), data_only=True, read_only=True)

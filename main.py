@@ -23,22 +23,21 @@ class ExtractDocumentRequest(BaseModel):
 
 @lru_cache()
 def get_engine():
-    return DocprocEngine(
-        EngineConfig(
-            vllm_base_url=os.getenv("VLLM_BASE_URL", "http://127.0.0.1:8000/v1"),
-            vllm_api_key=os.getenv("VLLM_API_KEY", ""),
-            vision_model=os.getenv("VLLM_VISION_MODEL", ""),
-            request_timeout=int(os.getenv("DOCPROC_REQUEST_TIMEOUT", "600")),
-            max_page_limit=int(os.getenv("DOCPROC_MAX_PAGE_LIMIT", "500")),
-            max_concurrent_ocr=int(os.getenv("DOCPROC_MAX_CONCURRENT_OCR", "128")),
-            office_render_timeout=int(os.getenv("DOCPROC_OFFICE_RENDER_TIMEOUT", "600")),
-            sliding_window_size=int(os.getenv("DOCPROC_SLIDING_WINDOW_SIZE", "64")),
-            render_xlsx=os.getenv("DOCPROC_RENDER_XLSX", "true").lower() == "true",
-
-            render_docx=os.getenv("DOCPROC_RENDER_DOCX", "true").lower() == "true",
-            render_pptx=os.getenv("DOCPROC_RENDER_PPTX", "true").lower() == "true",
-        )
+    config = EngineConfig(
+        vllm_base_url=os.getenv("VLLM_BASE_URL", "http://127.0.0.1:8000/v1"),
+        vllm_api_key=os.getenv("VLLM_API_KEY", ""),
+        vision_model=os.getenv("VLLM_VISION_MODEL", ""),
+        request_timeout=int(os.getenv("DOCPROC_REQUEST_TIMEOUT", "600")),
+        max_page_limit=int(os.getenv("DOCPROC_MAX_PAGE_LIMIT", "500")),
+        max_concurrent_ocr=int(os.getenv("DOCPROC_MAX_CONCURRENT_OCR", "128")),
+        office_render_timeout=int(os.getenv("DOCPROC_OFFICE_RENDER_TIMEOUT", "600")),
+        sliding_window_size=int(os.getenv("DOCPROC_SLIDING_WINDOW_SIZE", "64")),
+        render_xlsx=os.getenv("DOCPROC_RENDER_XLSX", "true").lower() == "true",
+        render_docx=os.getenv("DOCPROC_RENDER_DOCX", "true").lower() == "true",
+        render_pptx=os.getenv("DOCPROC_RENDER_PPTX", "true").lower() == "true",
     )
+    logger.info(f"Initialized DocprocEngine with: RENDER_XLSX={config.render_xlsx}, RENDER_DOCX={config.render_docx}, RENDER_PPTX={config.render_pptx}")
+    return DocprocEngine(config)
 
 @app.get("/health")
 def health():
