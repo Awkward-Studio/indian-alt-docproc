@@ -88,15 +88,39 @@ class DocprocEngine:
             
             # Office Speed Path
             text_export = ""
-            if ext in {".docx", ".doc"}: text_export = self._extract_docx_text(file_content, limit)
-            elif ext in {".pptx", ".ppt"}: text_export = self._extract_pptx_text(file_content, limit)
+            should_render = True
+            
+            if ext in {".docx", ".doc"}: 
+                text_export = self._extract_docx_text(file_content, limit)
+                should_render = self.config.render_docx
+            elif ext in {".pptx", ".ppt"}: 
+                text_export = self._extract_pptx_text(file_content, limit)
+                should_render = self.config.render_pptx
             elif ext in {".xlsx", ".xls"}: 
-                try: text_export, _ = self._extract_xlsx_text(file_content, limit)
-                except: pass
+                try: 
+                    text_export, _ = self._extract_xlsx_text(file_content, limit)
+                except Exception as e:
+                    logger.error(f"Top-level Excel extraction error: {e}")
+                
+                # STRENGTHENED: Excel is never rendered unless explicitly requested AND text failed
+                should_render = self.config.render_xlsx and not text_export.strip()
+                if not should_render:
+                    logger.info(f"Excel rendering is disabled or text extraction succeeded. Staying on text path.")
 
-            if len(file_content) < 51200 and text_export.strip():
-                return self._build_result(raw_text=text_export, normalized_text=text_export, quality_flags=["direct_text"])
+            # 1. If we got text and we aren't supposed to render, return immediately (BYPASS SIZE LIMIT)
+            if text_export.strip() and not should_render:
+                return self._build_result(raw_text=text_export, normalized_text=text_export, quality_flags=["direct_text", "no_render"])
 
+            # 2. If it's a small file and we got text, return immediately
+            if text_export.strip() and len(file_content) < 51200:
+                return self._build_result(raw_text=text_export, normalized_text=text_export, quality_flags=["direct_text", "small_file"])
+
+            # 3. If rendering is disabled and text failed, return failure instead of rendering
+            if not should_render and not text_export.strip():
+                return self._build_result(raw_text="", normalized_text="", quality_flags=["failed_text_no_render"], error="Text extraction failed and rendering is disabled for this type")
+
+            # 4. Fallback to rendering (PDF + Vision)
+            logger.info(f"Falling back to rendering path for {filename} (should_render={should_render})")
             rendered = self._render_office_to_pdf_and_extract(file_content, filename, limit, hint=hint)
             return self._merge_extraction_results(rendered, text_export=text_export, route="render_plus_text", fallback_flag=f"{ext}_text_only")
         except Exception as e:
@@ -237,11 +261,13 @@ class DocprocEngine:
         High-fidelity Excel extraction.
         Converts sheets to Markdown tables for optimal LLM consumption.
         """
+        filename_hint = "Excel File"
         try:
             import pandas as pd
             # Use pandas for industrial-grade table parsing
             excel_file = io.BytesIO(file_content)
             # Read all sheets
+            logger.info(f"Attempting pandas extraction for Excel...")
             all_sheets = pd.read_excel(excel_file, sheet_name=None, engine='openpyxl')
             
             res = []
@@ -259,21 +285,39 @@ class DocprocEngine:
 
                 res.append(f"### SHEET: {name}")
                 # Convert to high-contrast Markdown table
-                res.append(df.to_markdown(index=False))
+                try:
+                    res.append(df.to_markdown(index=False))
+                except Exception as table_err:
+                    logger.warning(f"Markdown table conversion failed for sheet {name}, using TSV: {table_err}")
+                    res.append(df.to_csv(sep='\t', index=False))
                 res.append("\n")
 
-            return "\n\n".join(res), sheet_names
+            text_out = "\n\n".join(res)
+            logger.info(f"Pandas extraction complete. Extracted {len(text_out)} characters from {len(sheet_names)} sheets.")
+            return text_out, sheet_names
         except Exception as e:
-            logger.warning(f"Advanced Excel extraction failed, using basic fallback: {e}")
+            logger.error(f"Advanced pandas Excel extraction failed: {e}")
             try:
                 # Basic fallback if pandas fails
+                logger.info("Attempting openpyxl read_only fallback...")
                 from openpyxl import load_workbook
                 wb = load_workbook(io.BytesIO(file_content), data_only=True, read_only=True)
                 res = []
                 for name in wb.sheetnames:
-                    res.append(f"--- {name} ---\n" + "\n".join(["\t".join([str(c) if c else "" for c in r]) for r in wb[name].iter_rows(values_only=True)]))
-                return "\n".join(res), wb.sheetnames
-            except:
+                    rows = []
+                    # Limit rows in fallback to prevent massive strings
+                    for row_idx, r in enumerate(wb[name].iter_rows(values_only=True)):
+                        rows.append("\t".join([str(c) if c else "" for c in r]))
+                        if row_idx > 5000: # Safety cap
+                            rows.append("... [TRUNCATED DUE TO SIZE] ...")
+                            break
+                    res.append(f"--- {name} ---\n" + "\n".join(rows))
+                
+                text_out = "\n".join(res)
+                logger.info(f"Openpyxl fallback complete. Extracted {len(text_out)} characters.")
+                return text_out, wb.sheetnames
+            except Exception as e2:
+                logger.error(f"Openpyxl fallback also failed: {e2}")
                 return "", []
 
     @staticmethod
