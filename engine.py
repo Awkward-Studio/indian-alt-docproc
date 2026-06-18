@@ -30,12 +30,20 @@ class EngineConfig:
     vision_model: str
     request_timeout: int = 600
     max_page_limit: int = 500
-    max_concurrent_ocr: int = 96
+    max_concurrent_ocr: int = 4
     office_render_timeout: int = 600
-    sliding_window_size: int = 50
-    render_xlsx: bool = True
-    render_docx: bool = True
+    sliding_window_size: int = 8
+    render_xlsx: bool = False
+    render_docx: bool = False
     render_pptx: bool = True
+    pdf_render_zoom: float = 1.5
+    image_max_dim: int = 1400
+    image_jpeg_quality: int = 82
+    vision_max_tokens: int = 3000
+    pdf_text_min_chars_per_page: int = 40
+    pdf_ocr_if_text_coverage_below: float = 0.70
+    xlsx_max_rows_per_sheet: int = 20000
+    xlsx_max_cols_per_sheet: int = 80
 
 class DocprocEngine:
     def __init__(self, config: EngineConfig):
@@ -84,7 +92,7 @@ class DocprocEngine:
         logger.info(f"--- START EXTRACTION: {filename} (Ext: {ext}) ---")
         try:
             if ext in {".png", ".jpg", ".jpeg", ".pdf"}:
-                logger.info(f"[{filename}] Using Vision Path (Direct/Sliding Window)")
+                logger.info(f"[{filename}] Using PDF/Image extraction path")
                 return self._extract_via_vision(file_content=file_content, filename=filename, page_limit=limit, hint=hint)
             
             # Office Speed Path
@@ -102,14 +110,20 @@ class DocprocEngine:
             elif ext in {".pptx", ".ppt", ".odp"}: 
                 logger.info(f"[{filename}] Attempting PowerPoint/Slides text extraction...")
                 text_export = self._extract_pptx_text(file_content, limit)
-                should_render = self.config.render_pptx
+                should_render = self.config.render_pptx and self._pptx_has_visual_content(file_content)
                 logger.info(f"[{filename}] PowerPoint extraction complete. Chars: {len(text_export)}, should_render: {should_render}")
 
             # 3. Excel/Tabular Path (STRENGTHENED)
             elif ext in {".xlsx", ".xls", ".xlsm", ".xlsb", ".csv", ".ods"}: 
                 logger.info(f"[{filename}] Attempting Excel/Tabular text extraction...")
                 try: 
-                    text_export, _ = self._extract_xlsx_text(file_content, limit, filename=filename)
+                    text_export, _ = self._extract_xlsx_text(
+                        file_content,
+                        limit,
+                        filename=filename,
+                        max_rows_per_sheet=self.config.xlsx_max_rows_per_sheet,
+                        max_cols_per_sheet=self.config.xlsx_max_cols_per_sheet,
+                    )
                 except Exception as e:
                     logger.error(f"[{filename}] Top-level Excel extraction error: {e}")
                 
@@ -159,39 +173,83 @@ class DocprocEngine:
         try:
             with fitz.open(stream=file_content, filetype="pdf") as doc:
                 limit = min(page_limit, len(doc)) if page_limit else len(doc)
-                logger.info(f"[{filename}] Sliding window for {limit} pages...")
-                
-                # TUNABLE KNOB: window_size
-                window_size = self.config.sliding_window_size
-                for start_idx in range(0, limit, window_size):
-                    end_idx = min(start_idx + window_size, limit)
-                    batch_images = []
-                    for i in range(start_idx, end_idx):
-                        pix = doc[i].get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
-                        batch_images.append(self._optimize_and_encode(pix.tobytes("png")))
+                logger.info(f"[{filename}] Inspecting {limit} PDF pages before OCR...")
+
+                text_pages: list[str] = []
+                low_text_pages: list[tuple[int, bool]] = []
+                searchable_pages = 0
+
+                for i in range(limit):
+                    page = doc[i]
+                    page_text = (page.get_text("text", sort=True) or "").strip()
+                    text_pages.append(page_text)
+                    if len(page_text) >= self.config.pdf_text_min_chars_per_page:
+                        searchable_pages += 1
+                    else:
+                        has_visual_content = bool(page.get_images(full=True)) or bool(page.get_drawings())
+                        low_text_pages.append((i, has_visual_content))
+
+                text_coverage = searchable_pages / limit if limit else 0
+                if text_coverage >= self.config.pdf_ocr_if_text_coverage_below:
+                    ocr_page_indexes = [idx for idx, has_visual_content in low_text_pages if has_visual_content]
+                else:
+                    ocr_page_indexes = [idx for idx, _ in low_text_pages]
+
+                if not ocr_page_indexes:
+                    full_text = "\n\n".join(
+                        f"--- {filename} (PAGE {idx + 1}) ---\n{text}"
+                        for idx, text in enumerate(text_pages)
+                        if text
+                    ).strip()
+                    logger.info(f"[{filename}] PDF text shortcut. Coverage={text_coverage:.2f}; OCR skipped.")
+                    return self._build_result(
+                        raw_text=full_text,
+                        normalized_text=full_text,
+                        quality_flags=["pdf_text", "ocr_skipped"],
+                        render_metadata={"page_count": limit, "ocr_page_count": 0, "text_coverage": round(text_coverage, 3)},
+                    )
+
+                logger.info(f"[{filename}] OCR needed for {len(ocr_page_indexes)}/{limit} pages. Text coverage={text_coverage:.2f}")
+                pages_results = [
+                    f"--- {filename} (PAGE {idx + 1}) ---\n{text}" if text else None
+                    for idx, text in enumerate(text_pages)
+                ]
+
+                window_size = max(1, self.config.sliding_window_size)
+                for start in range(0, len(ocr_page_indexes), window_size):
+                    page_batch = ocr_page_indexes[start:start + window_size]
+                    batch_images: list[tuple[int, str]] = []
+                    for page_idx in page_batch:
+                        pix = doc[page_idx].get_pixmap(matrix=fitz.Matrix(self.config.pdf_render_zoom, self.config.pdf_render_zoom), alpha=False)
+                        batch_images.append((page_idx, self._optimize_and_encode(pix.tobytes("jpeg"))))
                         del pix
-                    
-                    batch_texts = [None] * len(batch_images)
-                    with ThreadPoolExecutor(max_workers=self.config.max_concurrent_ocr) as executor:
-                        future_to_idx = {
-                            executor.submit(self._vision_transcribe_page, img, filename=filename, page_number=start_idx+i+1, hint=hint): i 
-                            for i, img in enumerate(batch_images)
+
+                    max_workers = min(self.config.max_concurrent_ocr, len(batch_images)) or 1
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        future_to_page = {
+                            executor.submit(self._vision_transcribe_page, img, filename=filename, page_number=page_idx + 1, hint=hint): page_idx
+                            for page_idx, img in batch_images
                         }
-                        for future in as_completed(future_to_idx):
-                            idx = future_to_idx[future]
-                            batch_texts[idx] = f"--- {filename} (PAGE {start_idx+idx+1}) ---\n{future.result()}"
-                    
-                    pages_results.extend(batch_texts)
+                        for future in as_completed(future_to_page):
+                            page_idx = future_to_page[future]
+                            pages_results[page_idx] = f"--- {filename} (PAGE {page_idx + 1}) ---\n{future.result()}"
+
                     batch_images.clear()
                     gc.collect()
-                    logger.info(f"  Progress: {len(pages_results)}/{limit}")
+                    completed = min(start + len(page_batch), len(ocr_page_indexes))
+                    logger.info(f"  OCR progress: {completed}/{len(ocr_page_indexes)} pages")
 
         except Exception as e:
             logger.error(f"PDF failed: {e}")
             return self._build_result(raw_text="", normalized_text="", quality_flags=["failed"], error=str(e))
 
         full_text = "\n\n".join([p for p in pages_results if p]).strip()
-        return self._build_result(raw_text=full_text, normalized_text=full_text, quality_flags=["vision_first", "sliding_window"])
+        return self._build_result(
+            raw_text=full_text,
+            normalized_text=full_text,
+            quality_flags=["pdf_hybrid", "vision_ocr"],
+            render_metadata={"page_count": limit, "ocr_page_count": len(ocr_page_indexes), "text_coverage": round(text_coverage, 3)},
+        )
 
     def _vision_transcribe_page(self, image_b64: str, *, filename: str, page_number: int, hint: str | None = None) -> str:
         headers = {"Content-Type": "application/json"}
@@ -212,10 +270,10 @@ class DocprocEngine:
                     "model": self.config.vision_model,
                     "messages": [{"role": "user", "content": [
                         {"type": "text", "text": final_prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}}
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}}
                     ]}],
                     "temperature": 0.1,
-                    "max_tokens": 4000,
+                    "max_tokens": self.config.vision_max_tokens,
                 },
                 timeout=self.config.request_timeout,
             )
@@ -224,12 +282,14 @@ class DocprocEngine:
 
     def _optimize_and_encode(self, img_bytes: bytes) -> str:
         img = Image.open(io.BytesIO(img_bytes))
-        max_dim = 1600
+        if img.mode not in {"RGB", "L"}:
+            img = img.convert("RGB")
+        max_dim = max(256, self.config.image_max_dim)
         if max(img.size) > max_dim:
             ratio = max_dim / float(max(img.size))
             img = img.resize((int(img.size[0] * ratio), int(img.size[1] * ratio)), Image.LANCZOS)
         output = io.BytesIO()
-        img.save(output, format="PNG", optimize=True)
+        img.save(output, format="JPEG", quality=self.config.image_jpeg_quality, optimize=True)
         return base64.b64encode(output.getvalue()).decode("utf-8")
 
     def _render_office_to_pdf_and_extract(self, file_content: bytes, filename: str, page_limit: int | None, hint: str | None = None) -> dict[str, Any] | None:
@@ -273,22 +333,55 @@ class DocprocEngine:
     def _extract_pptx_text(file_content: bytes, page_limit: int | None) -> str:
         try:
             prs = Presentation(io.BytesIO(file_content))
-            return "\n".join([s.shapes[i].text for s in prs.slides for i in range(len(s.shapes)) if hasattr(s.shapes[i], "text")])
+            slides = prs.slides
+            limit = min(page_limit, len(slides)) if page_limit else len(slides)
+            parts = []
+            for slide_idx in range(limit):
+                slide_parts = []
+                for shape in slides[slide_idx].shapes:
+                    if getattr(shape, "has_table", False):
+                        for row in shape.table.rows:
+                            slide_parts.append("\t".join(cell.text.strip() for cell in row.cells))
+                    elif hasattr(shape, "text") and shape.text:
+                        slide_parts.append(shape.text.strip())
+                if slide_parts:
+                    parts.append(f"--- SLIDE {slide_idx + 1} ---\n" + "\n".join(slide_parts))
+            return "\n\n".join(parts)
         except: return ""
 
     @staticmethod
-    def _extract_xlsx_text(file_content: bytes, page_limit: int | None, filename: str = "") -> tuple[str, list[str]]:
+    def _pptx_has_visual_content(file_content: bytes) -> bool:
+        try:
+            prs = Presentation(io.BytesIO(file_content))
+            for slide in prs.slides:
+                for shape in slide.shapes:
+                    if hasattr(shape, "image") or getattr(shape, "has_chart", False):
+                        return True
+                    if not getattr(shape, "has_table", False) and not (hasattr(shape, "text") and shape.text.strip()):
+                        return True
+            return False
+        except Exception:
+            return True
+
+    @staticmethod
+    def _extract_xlsx_text(
+        file_content: bytes,
+        page_limit: int | None,
+        filename: str = "",
+        max_rows_per_sheet: int = 20000,
+        max_cols_per_sheet: int = 80,
+    ) -> tuple[str, list[str]]:
         """
         High-fidelity Excel/CSV extraction.
         Converts sheets to Markdown tables for optimal LLM consumption.
         """
         ext = os.path.splitext(filename)[1].lower() if filename else ""
         try:
-            import pandas as pd
             excel_file = io.BytesIO(file_content)
             
             # Special Case: CSV
             if ext == ".csv":
+                import pandas as pd
                 logger.info(f"Attempting pandas CSV extraction...")
                 df = pd.read_csv(excel_file)
                 if df.empty: return "", []
@@ -296,8 +389,50 @@ class DocprocEngine:
                 text_out = df.to_markdown(index=False)
                 return text_out, ["CSV_Sheet"]
 
+            if ext in {".xlsx", ".xlsm", ".xltx", ".xltm", ""}:
+                logger.info("Attempting streaming openpyxl extraction for modern Excel...")
+                wb = load_workbook(excel_file, data_only=True, read_only=True)
+                sheet_names = wb.sheetnames[:page_limit] if page_limit else wb.sheetnames
+                res = []
+                for name in sheet_names:
+                    sheet = wb[name]
+                    rows = []
+                    used_cols = 0
+                    for row_idx, row in enumerate(sheet.iter_rows(values_only=True), start=1):
+                        if row_idx > max_rows_per_sheet:
+                            rows.append(["... [TRUNCATED DUE TO ROW LIMIT] ..."])
+                            break
+                        values = ["" if cell is None else str(cell) for cell in row[:max_cols_per_sheet]]
+                        while values and not values[-1]:
+                            values.pop()
+                        if not any(values):
+                            continue
+                        used_cols = max(used_cols, len(values))
+                        rows.append(values)
+
+                    if not rows:
+                        continue
+
+                    res.append(f"### SHEET: {name}")
+                    if len(rows) <= 250 and used_cols <= 20:
+                        header = rows[0] + [""] * (used_cols - len(rows[0]))
+                        res.append("| " + " | ".join(header) + " |")
+                        res.append("| " + " | ".join(["---"] * used_cols) + " |")
+                        for row in rows[1:]:
+                            padded = row + [""] * (used_cols - len(row))
+                            res.append("| " + " | ".join(padded) + " |")
+                    else:
+                        res.extend("\t".join(row) for row in rows)
+                    res.append("")
+
+                wb.close()
+                text_out = "\n".join(res)
+                logger.info(f"Streaming Excel extraction complete. Extracted {len(text_out)} characters from {len(sheet_names)} sheets.")
+                return text_out, sheet_names
+
             # Standard Excel Path
             logger.info(f"Attempting pandas extraction for Excel ({ext})...")
+            import pandas as pd
             # engine='openpyxl' supports xlsx, xlsm, xltx, xltm. 
             # engine='pyxlsb' for xlsb. 
             # engine='xlrd' for old xls.
@@ -305,6 +440,7 @@ class DocprocEngine:
             engine = 'openpyxl'
             if ext == ".xlsb": engine = 'pyxlsb'
             elif ext == ".xls": engine = 'xlrd'
+            elif ext == ".ods": engine = 'odf'
 
             all_sheets = pd.read_excel(excel_file, sheet_name=None, engine=engine)
             
@@ -334,11 +470,10 @@ class DocprocEngine:
             logger.info(f"Pandas extraction complete. Extracted {len(text_out)} characters from {len(sheet_names)} sheets.")
             return text_out, sheet_names
         except Exception as e:
-            logger.error(f"Advanced pandas Excel extraction failed: {e}")
+            logger.error(f"Excel extraction failed: {e}")
             try:
                 # Basic fallback if pandas fails (openpyxl only supports modern XML formats)
                 logger.info("Attempting openpyxl read_only fallback...")
-                from openpyxl import load_workbook
                 wb = load_workbook(io.BytesIO(file_content), data_only=True, read_only=True)
                 res = []
                 for name in wb.sheetnames:

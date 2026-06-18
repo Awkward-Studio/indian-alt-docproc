@@ -18,9 +18,19 @@ It is responsible for:
 - `DOCPROC_REQUEST_TIMEOUT`
 - `DOCPROC_MAX_CONCURRENT_OCR`
 - `DOCPROC_OFFICE_RENDER_TIMEOUT`
+- `DOCPROC_SLIDING_WINDOW_SIZE`
 - `DOCPROC_RENDER_DOCX`
 - `DOCPROC_RENDER_PPTX`
 - `DOCPROC_RENDER_XLSX`
+- `DOCPROC_PDF_RENDER_ZOOM`
+- `DOCPROC_IMAGE_MAX_DIM`
+- `DOCPROC_IMAGE_JPEG_QUALITY`
+- `DOCPROC_VISION_MAX_TOKENS`
+- `DOCPROC_PDF_TEXT_MIN_CHARS_PER_PAGE`
+- `DOCPROC_PDF_OCR_IF_TEXT_COVERAGE_BELOW`
+- `DOCPROC_XLSX_MAX_ROWS_PER_SHEET`
+- `DOCPROC_XLSX_MAX_COLS_PER_SHEET`
+- `DOCPROC_UVICORN_WORKERS`
 
 ## Local Run
 
@@ -83,7 +93,10 @@ Response JSON:
 
 Notes:
 - `docproc` renders and extracts on CPU/RAM; VRAM pressure comes from the OCR calls it makes into local `vLLM`.
-- `DOCPROC_MAX_CONCURRENT_OCR` is the main guardrail that prevents document fanout from flooding the H100 with too many simultaneous vision requests.
+- `DOCPROC_UVICORN_WORKERS` and `DOCPROC_MAX_CONCURRENT_OCR` together cap worst-case OCR fanout. The default is 2 workers x 4 OCR calls per worker.
+- PDFs are text-first. Searchable pages use embedded text, low-text visual pages are OCR'd, and blank pages are skipped.
+- Rendered OCR images are downscaled and JPEG-compressed before being sent to the vision model.
+- Modern Excel files use streaming extraction to avoid loading full workbooks into memory.
 - By default, `DOCX` and `XLSX` use VM-side structured extraction only. `PPTX` keeps render+OCR enabled by default because slide layout matters more.
 - If you want LibreOffice rendering for `DOCX` or `XLSX`, set `DOCPROC_RENDER_DOCX=true` or `DOCPROC_RENDER_XLSX=true`.
 - The main backend should only know `DOC_PROCESSOR_URL`; this service is designed to be deployed independently from the Django app.
