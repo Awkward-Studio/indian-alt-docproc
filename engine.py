@@ -1,4 +1,5 @@
 import base64
+import contextlib
 import csv
 import hashlib
 import io
@@ -351,11 +352,38 @@ class DocprocEngine:
 
     def _extract_spreadsheet_complete(self, file_content: bytes, filename: str = "") -> dict[str, Any]:
         ext = os.path.splitext(filename)[1].lower()
-        if ext == ".csv":
-            return self._extract_csv_complete(file_content, filename=filename)
-        if ext in {".xlsx", ".xlsm"}:
-            return self._extract_openpyxl_complete(file_content, filename=filename)
-        return self._extract_pandas_spreadsheet_complete(file_content, filename=filename)
+        try:
+            if ext == ".csv":
+                return self._extract_csv_complete(file_content, filename=filename)
+            if ext in {".xlsx", ".xlsm"}:
+                return self._extract_openpyxl_complete(file_content, filename=filename)
+            return self._extract_pandas_spreadsheet_complete(file_content, filename=filename)
+        except Exception as exc:
+            logger.warning(f"[{filename}] Structured spreadsheet reader failed: {exc}")
+            if ext in {".xls", ".ods"}:
+                recovered = self._extract_legacy_spreadsheet_via_libreoffice(file_content, filename=filename, original_error=exc)
+                if recovered:
+                    return recovered
+            digest = hashlib.sha256(file_content).hexdigest()
+            return {
+                "raw_extracted_text": "",
+                "normalized_text": "",
+                "quality_flags": ["spreadsheet_structured_failed"],
+                "render_metadata": {
+                    "route": "spreadsheet_structured",
+                    "content_sha256": digest,
+                    "reader_error": str(exc),
+                    "rendered_sheet_count": 0,
+                },
+                "structured_data": {
+                    "kind": "spreadsheet",
+                    "filename": filename,
+                    "content_sha256": digest,
+                    "sheets": [],
+                    "chunks": [],
+                },
+                "error": str(exc),
+            }
 
     def _extract_csv_complete(self, file_content: bytes, filename: str = "") -> dict[str, Any]:
         decoded = file_content.decode("utf-8-sig", errors="replace")
@@ -523,7 +551,8 @@ class DocprocEngine:
         ext = os.path.splitext(filename)[1].lower()
         engine = "pyxlsb" if ext == ".xlsb" else "xlrd" if ext == ".xls" else None
         digest = hashlib.sha256(file_content).hexdigest()
-        sheets_map = pd.read_excel(io.BytesIO(file_content), sheet_name=None, engine=engine, header=None, dtype=object)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            sheets_map = pd.read_excel(io.BytesIO(file_content), sheet_name=None, engine=engine, header=None, dtype=object)
         chunk_rows = max(1, self.config.spreadsheet_chunk_rows)
         text_parts = [f"# WORKBOOK: {filename}", f"SHA256: {digest}", ""]
         sheets = []
@@ -586,6 +615,55 @@ class DocprocEngine:
             },
             "structured_data": structured_data,
         }
+
+    def _extract_legacy_spreadsheet_via_libreoffice(self, file_content: bytes, filename: str, original_error: Exception) -> dict[str, Any] | None:
+        if not shutil.which("soffice"):
+            logger.warning(f"[{filename}] LibreOffice is unavailable for legacy spreadsheet recovery.")
+            return None
+        ext = os.path.splitext(filename)[1].lower() or ".xls"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profile_dir = os.path.join(temp_dir, "profile")
+            os.makedirs(profile_dir)
+            in_path = os.path.join(temp_dir, "in" + ext)
+            with open(in_path, "wb") as f:
+                f.write(file_content)
+            try:
+                subprocess.run(
+                    [
+                        "soffice",
+                        f"-env:UserInstallation=file://{profile_dir}",
+                        "--headless",
+                        "--convert-to",
+                        "xlsx",
+                        "--outdir",
+                        temp_dir,
+                        in_path,
+                    ],
+                    check=True,
+                    timeout=self.config.office_render_timeout,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                converted_path = os.path.join(temp_dir, "in.xlsx")
+                if not os.path.exists(converted_path):
+                    matches = [p for p in os.listdir(temp_dir) if p.lower().endswith(".xlsx")]
+                    if not matches:
+                        return None
+                    converted_path = os.path.join(temp_dir, matches[0])
+                with open(converted_path, "rb") as f:
+                    recovered = self._extract_openpyxl_complete(f.read(), filename=f"{filename}.converted.xlsx")
+                recovered["quality_flags"] = list(dict.fromkeys((recovered.get("quality_flags") or []) + ["legacy_spreadsheet_recovered"]))
+                recovered.setdefault("render_metadata", {})
+                recovered["render_metadata"]["route"] = "legacy_spreadsheet_converted_to_xlsx"
+                recovered["render_metadata"]["legacy_reader_error"] = str(original_error)
+                recovered["render_metadata"]["original_filename"] = filename
+                recovered.setdefault("structured_data", {})
+                recovered["structured_data"]["original_filename"] = filename
+                recovered["structured_data"]["converted_format"] = "xlsx"
+                return recovered
+            except Exception as exc:
+                logger.warning(f"[{filename}] LibreOffice legacy spreadsheet recovery failed: {exc}")
+                return None
 
     @staticmethod
     def _format_cell_value(raw_value: Any, cached_value: Any) -> str:
