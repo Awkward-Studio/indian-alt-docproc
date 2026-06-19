@@ -9,3 +9,5 @@ extract-msg
 Pillow
 pandas
 tabulate
+xlrd
+pyxlsb

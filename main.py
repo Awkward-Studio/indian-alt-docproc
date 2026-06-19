@@ -32,9 +32,10 @@ def get_engine():
         max_concurrent_ocr=int(os.getenv("DOCPROC_MAX_CONCURRENT_OCR", "128")),
         office_render_timeout=int(os.getenv("DOCPROC_OFFICE_RENDER_TIMEOUT", "600")),
         sliding_window_size=int(os.getenv("DOCPROC_SLIDING_WINDOW_SIZE", "64")),
-        render_xlsx=os.getenv("DOCPROC_RENDER_XLSX", "true").lower() == "true",
+        render_xlsx=os.getenv("DOCPROC_RENDER_XLSX", "false").lower() == "true",
         render_docx=os.getenv("DOCPROC_RENDER_DOCX", "true").lower() == "true",
         render_pptx=os.getenv("DOCPROC_RENDER_PPTX", "true").lower() == "true",
+        spreadsheet_chunk_rows=int(os.getenv("DOCPROC_SPREADSHEET_CHUNK_ROWS", "200")),
     )
     logger.info(f"Initialized DocprocEngine with: RENDER_XLSX={config.render_xlsx}, RENDER_DOCX={config.render_docx}, RENDER_PPTX={config.render_pptx}")
     return DocprocEngine(config)

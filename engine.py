@@ -1,4 +1,6 @@
 import base64
+import csv
+import hashlib
 import io
 import logging
 import os
@@ -17,6 +19,7 @@ import fitz  # PyMuPDF
 import requests
 from docx import Document
 from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
 from pptx import Presentation
 from PIL import Image
 
@@ -33,9 +36,10 @@ class EngineConfig:
     max_concurrent_ocr: int = 96
     office_render_timeout: int = 600
     sliding_window_size: int = 50
-    render_xlsx: bool = True
+    render_xlsx: bool = False
     render_docx: bool = True
     render_pptx: bool = True
+    spreadsheet_chunk_rows: int = 200
 
 class DocprocEngine:
     def __init__(self, config: EngineConfig):
@@ -107,20 +111,28 @@ class DocprocEngine:
 
             # 3. Excel/Tabular Path (STRENGTHENED)
             elif ext in {".xlsx", ".xls", ".xlsm", ".xlsb", ".csv", ".ods"}: 
-                logger.info(f"[{filename}] Attempting Excel/Tabular text extraction...")
-                try: 
-                    text_export, _ = self._extract_xlsx_text(file_content, limit, filename=filename)
-                except Exception as e:
-                    logger.error(f"[{filename}] Top-level Excel extraction error: {e}")
-                
-                # STRICT: If render_xlsx is False, we NEVER render, regardless of text success
+                logger.info(f"[{filename}] Using complete spreadsheet extraction path.")
+                spreadsheet = self._extract_spreadsheet_complete(file_content, filename=filename)
+                if spreadsheet.get("normalized_text"):
+                    return self._build_result(
+                        raw_text=spreadsheet["raw_extracted_text"],
+                        normalized_text=spreadsheet["normalized_text"],
+                        quality_flags=spreadsheet["quality_flags"],
+                        render_metadata=spreadsheet["render_metadata"],
+                        structured_data=spreadsheet["structured_data"],
+                    )
                 if not self.config.render_xlsx:
-                    should_render = False
-                    logger.info(f"[{filename}] Excel rendering is EXPLICITLY DISABLED. Proceeding with text only.")
-                else:
-                    # If rendering is allowed, only do it if text extraction completely failed
-                    should_render = not text_export.strip()
-                    logger.info(f"[{filename}] Excel text extraction result: {len(text_export)} chars. should_render set to {should_render}")
+                    return self._build_result(
+                        raw_text="",
+                        normalized_text="",
+                        quality_flags=spreadsheet.get("quality_flags") or ["spreadsheet_structured_failed"],
+                        render_metadata=spreadsheet.get("render_metadata") or {},
+                        structured_data=spreadsheet.get("structured_data") or {},
+                        error=spreadsheet.get("error") or "Spreadsheet extraction failed and whole-workbook rendering is disabled",
+                        transcription_status="failed",
+                    )
+                text_export = ""
+                should_render = True
 
             # Final Decision Logic
             if text_export.strip() and not should_render:
@@ -276,6 +288,254 @@ class DocprocEngine:
             return "\n".join([s.shapes[i].text for s in prs.slides for i in range(len(s.shapes)) if hasattr(s.shapes[i], "text")])
         except: return ""
 
+    def _extract_spreadsheet_complete(self, file_content: bytes, filename: str = "") -> dict[str, Any]:
+        ext = os.path.splitext(filename)[1].lower()
+        if ext == ".csv":
+            return self._extract_csv_complete(file_content, filename=filename)
+        if ext in {".xlsx", ".xlsm"}:
+            return self._extract_openpyxl_complete(file_content, filename=filename)
+        return self._extract_pandas_spreadsheet_complete(file_content, filename=filename)
+
+    def _extract_csv_complete(self, file_content: bytes, filename: str = "") -> dict[str, Any]:
+        decoded = file_content.decode("utf-8-sig", errors="replace")
+        rows = list(csv.reader(io.StringIO(decoded)))
+        chunk_rows = max(1, self.config.spreadsheet_chunk_rows)
+        chunks = []
+        text_parts = [f"# CSV: {filename}", ""]
+        for start in range(0, len(rows), chunk_rows):
+            end = min(start + chunk_rows, len(rows))
+            lines = [",".join(row) for row in rows[start:end]]
+            chunk_text = "\n".join(lines)
+            chunks.append({
+                "text": chunk_text,
+                "metadata": {
+                    "chunk_kind": "spreadsheet_range",
+                    "sheet_name": "CSV",
+                    "row_start": start + 1,
+                    "row_end": end,
+                    "column_start": "A",
+                    "column_end": get_column_letter(max((len(row) for row in rows[start:end]), default=1)),
+                },
+            })
+            text_parts.append(f"## SHEET: CSV rows {start + 1}-{end}")
+            text_parts.append(chunk_text)
+            text_parts.append("")
+        digest = hashlib.sha256(file_content).hexdigest()
+        structured_data = {
+            "kind": "spreadsheet",
+            "format": "csv",
+            "filename": filename,
+            "content_sha256": digest,
+            "sheets": [{"name": "CSV", "row_count": len(rows), "column_count": max((len(row) for row in rows), default=0)}],
+            "chunks": chunks,
+        }
+        return {
+            "raw_extracted_text": "\n".join(text_parts).strip(),
+            "normalized_text": "\n".join(text_parts).strip(),
+            "quality_flags": ["spreadsheet_structured", "raw_complete", "artifact_backed", "csv"],
+            "render_metadata": {
+                "route": "spreadsheet_structured",
+                "content_sha256": digest,
+                "sheet_count": 1,
+                "row_count": len(rows),
+                "rendered_sheet_count": 0,
+            },
+            "structured_data": structured_data,
+        }
+
+    def _extract_openpyxl_complete(self, file_content: bytes, filename: str = "") -> dict[str, Any]:
+        ext = os.path.splitext(filename)[1].lower()
+        digest = hashlib.sha256(file_content).hexdigest()
+        formula_wb = load_workbook(io.BytesIO(file_content), data_only=False, read_only=True)
+        value_wb = load_workbook(io.BytesIO(file_content), data_only=True, read_only=True)
+        chunk_rows = max(1, self.config.spreadsheet_chunk_rows)
+        text_parts = [f"# WORKBOOK: {filename}", f"SHA256: {digest}", ""]
+        sheets = []
+        chunks = []
+        flags = ["spreadsheet_structured", "raw_complete", "artifact_backed"]
+
+        for sheet_name in formula_wb.sheetnames:
+            ws_formula = formula_wb[sheet_name]
+            ws_value = value_wb[sheet_name]
+            max_row = ws_formula.max_row or 0
+            max_col = ws_formula.max_column or 0
+            column_end = get_column_letter(max_col) if max_col else "A"
+            hidden = ws_formula.sheet_state != "visible"
+            merged_cells = getattr(ws_formula, "merged_cells", None)
+            merged_ranges = [str(rng) for rng in getattr(merged_cells, "ranges", [])]
+            sheet_info = {
+                "name": sheet_name,
+                "row_count": max_row,
+                "column_count": max_col,
+                "column_start": "A",
+                "column_end": column_end,
+                "hidden": hidden,
+                "merged_ranges": merged_ranges,
+            }
+            sheets.append(sheet_info)
+            if hidden and "hidden_sheets_present" not in flags:
+                flags.append("hidden_sheets_present")
+            if merged_ranges and "merged_cells_present" not in flags:
+                flags.append("merged_cells_present")
+
+            text_parts.append(f"## SHEET: {sheet_name}")
+            text_parts.append(f"ROWS: {max_row} COLUMNS: {max_col} HIDDEN: {hidden}")
+            if merged_ranges:
+                text_parts.append("MERGED_RANGES: " + ", ".join(merged_ranges))
+
+            chunk_buffer = []
+            chunk_start = 1
+            for row_index, (formula_row, value_row) in enumerate(
+                zip(ws_formula.iter_rows(values_only=False), ws_value.iter_rows(values_only=True)),
+                start=1,
+            ):
+                values = []
+                for col_index in range(1, max_col + 1):
+                    formula_cell = formula_row[col_index - 1] if col_index <= len(formula_row) else None
+                    cached_value = value_row[col_index - 1] if col_index <= len(value_row) else None
+                    raw_value = formula_cell.value if formula_cell is not None else None
+                    formatted = self._format_cell_value(raw_value, cached_value)
+                    values.append(formatted)
+                    if isinstance(raw_value, str) and raw_value.startswith("=") and "formulas_present" not in flags:
+                        flags.append("formulas_present")
+                row_text = f"{row_index}\t" + "\t".join(values)
+                text_parts.append(row_text)
+                chunk_buffer.append(row_text)
+
+                if len(chunk_buffer) >= chunk_rows:
+                    chunks.append({
+                        "text": "\n".join(chunk_buffer),
+                        "metadata": {
+                            "chunk_kind": "spreadsheet_range",
+                            "sheet_name": sheet_name,
+                            "row_start": chunk_start,
+                            "row_end": row_index,
+                            "column_start": "A",
+                            "column_end": column_end,
+                        },
+                    })
+                    chunk_buffer = []
+                    chunk_start = row_index + 1
+
+            if chunk_buffer:
+                chunks.append({
+                    "text": "\n".join(chunk_buffer),
+                    "metadata": {
+                        "chunk_kind": "spreadsheet_range",
+                        "sheet_name": sheet_name,
+                        "row_start": chunk_start,
+                        "row_end": max_row,
+                        "column_start": "A",
+                        "column_end": column_end,
+                    },
+                })
+            text_parts.append("")
+
+        formula_wb.close()
+        value_wb.close()
+        structured_data = {
+            "kind": "spreadsheet",
+            "format": ext.lstrip("."),
+            "filename": filename,
+            "content_sha256": digest,
+            "sheets": sheets,
+            "chunks": chunks,
+        }
+        normalized_text = "\n".join(text_parts).strip()
+        return {
+            "raw_extracted_text": normalized_text,
+            "normalized_text": normalized_text,
+            "quality_flags": flags,
+            "render_metadata": {
+                "route": "spreadsheet_structured",
+                "content_sha256": digest,
+                "sheet_count": len(sheets),
+                "sheets": sheets,
+                "spreadsheet_chunk_count": len(chunks),
+                "rendered_sheet_count": 0,
+            },
+            "structured_data": structured_data,
+        }
+
+    def _extract_pandas_spreadsheet_complete(self, file_content: bytes, filename: str = "") -> dict[str, Any]:
+        import pandas as pd
+        ext = os.path.splitext(filename)[1].lower()
+        engine = "pyxlsb" if ext == ".xlsb" else "xlrd" if ext == ".xls" else None
+        digest = hashlib.sha256(file_content).hexdigest()
+        sheets_map = pd.read_excel(io.BytesIO(file_content), sheet_name=None, engine=engine, header=None, dtype=object)
+        chunk_rows = max(1, self.config.spreadsheet_chunk_rows)
+        text_parts = [f"# WORKBOOK: {filename}", f"SHA256: {digest}", ""]
+        sheets = []
+        chunks = []
+        for sheet_name, df in sheets_map.items():
+            row_count = int(df.shape[0])
+            column_count = int(df.shape[1])
+            column_end = get_column_letter(column_count) if column_count else "A"
+            sheets.append({
+                "name": sheet_name,
+                "row_count": row_count,
+                "column_count": column_count,
+                "column_start": "A",
+                "column_end": column_end,
+                "hidden": None,
+                "merged_ranges": [],
+            })
+            text_parts.append(f"## SHEET: {sheet_name}")
+            text_parts.append(f"ROWS: {row_count} COLUMNS: {column_count}")
+            rows = []
+            for idx, row in df.iterrows():
+                values = ["" if pd.isna(value) else str(value) for value in row.tolist()]
+                rows.append(f"{idx + 1}\t" + "\t".join(values))
+            for start in range(0, len(rows), chunk_rows):
+                end = min(start + chunk_rows, len(rows))
+                chunk_text = "\n".join(rows[start:end])
+                chunks.append({
+                    "text": chunk_text,
+                    "metadata": {
+                        "chunk_kind": "spreadsheet_range",
+                        "sheet_name": sheet_name,
+                        "row_start": start + 1,
+                        "row_end": end,
+                        "column_start": "A",
+                        "column_end": column_end,
+                    },
+                })
+                text_parts.append(chunk_text)
+            text_parts.append("")
+        structured_data = {
+            "kind": "spreadsheet",
+            "format": ext.lstrip("."),
+            "filename": filename,
+            "content_sha256": digest,
+            "sheets": sheets,
+            "chunks": chunks,
+        }
+        normalized_text = "\n".join(text_parts).strip()
+        return {
+            "raw_extracted_text": normalized_text,
+            "normalized_text": normalized_text,
+            "quality_flags": ["spreadsheet_structured", "raw_complete", "artifact_backed"],
+            "render_metadata": {
+                "route": "spreadsheet_structured",
+                "content_sha256": digest,
+                "sheet_count": len(sheets),
+                "sheets": sheets,
+                "spreadsheet_chunk_count": len(chunks),
+                "rendered_sheet_count": 0,
+            },
+            "structured_data": structured_data,
+        }
+
+    @staticmethod
+    def _format_cell_value(raw_value: Any, cached_value: Any) -> str:
+        if raw_value is None and cached_value is None:
+            return ""
+        if isinstance(raw_value, str) and raw_value.startswith("="):
+            if cached_value is not None and cached_value != raw_value:
+                return f"{raw_value} => {cached_value}"
+            return raw_value
+        return str(raw_value if raw_value is not None else cached_value)
+
     @staticmethod
     def _extract_xlsx_text(file_content: bytes, page_limit: int | None, filename: str = "") -> tuple[str, list[str]]:
         """
@@ -359,5 +619,5 @@ class DocprocEngine:
                 return "", []
 
     @staticmethod
-    def _build_result(*, raw_text: str, normalized_text: str, quality_flags: list[str], render_metadata: dict = None, transcription_status="complete", error=None) -> dict:
-        return {"raw_extracted_text": raw_text, "normalized_text": normalized_text, "extraction_mode": "docproc_remote", "transcription_status": transcription_status, "quality_flags": quality_flags, "render_metadata": render_metadata or {}, "error": error}
+    def _build_result(*, raw_text: str, normalized_text: str, quality_flags: list[str], render_metadata: dict = None, structured_data: dict = None, transcription_status="complete", error=None) -> dict:
+        return {"raw_extracted_text": raw_text, "normalized_text": normalized_text, "extraction_mode": "docproc_remote", "transcription_status": transcription_status, "quality_flags": quality_flags, "render_metadata": render_metadata or {}, "structured_data": structured_data or {}, "error": error}
