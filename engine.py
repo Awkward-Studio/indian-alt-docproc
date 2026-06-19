@@ -101,6 +101,13 @@ class DocprocEngine:
                 text_export = self._extract_docx_text(file_content, limit)
                 should_render = self.config.render_docx
                 logger.info(f"[{filename}] Word extraction complete. Chars: {len(text_export)}, should_render: {should_render}")
+                if ext == ".docx" and self._has_meaningful_text(text_export):
+                    logger.info(f"[{filename}] SUCCESS: Returning native DOCX text.")
+                    return self._build_result(
+                        raw_text=text_export,
+                        normalized_text=text_export,
+                        quality_flags=["direct_text", "docx_native", "no_render"],
+                    )
 
             # 2. PPTX Path
             elif ext in {".pptx", ".ppt", ".odp"}: 
@@ -164,7 +171,15 @@ class DocprocEngine:
         ext = os.path.splitext(filename)[1].lower()
         if ext in {".png", ".jpg", ".jpeg"}:
             img_b64 = self._optimize_and_encode(file_content)
-            text = self._vision_transcribe_page(img_b64, filename=filename, page_number=1, hint=hint)
+            text = self._clean_vision_text(self._vision_transcribe_page(img_b64, filename=filename, page_number=1, hint=hint))
+            if not self._has_meaningful_text(text):
+                return self._build_result(
+                    raw_text="",
+                    normalized_text="",
+                    quality_flags=["vision_first", "empty_vision_output"],
+                    transcription_status="failed",
+                    error="Vision extraction produced no readable content",
+                )
             return self._build_result(raw_text=text, normalized_text=text, quality_flags=["vision_first"])
 
         pages_results = []
@@ -191,7 +206,9 @@ class DocprocEngine:
                         }
                         for future in as_completed(future_to_idx):
                             idx = future_to_idx[future]
-                            batch_texts[idx] = f"--- {filename} (PAGE {start_idx+idx+1}) ---\n{future.result()}"
+                            page_text = self._clean_vision_text(future.result())
+                            if self._has_meaningful_text(page_text):
+                                batch_texts[idx] = f"--- {filename} (PAGE {start_idx+idx+1}) ---\n{page_text}"
                     
                     pages_results.extend(batch_texts)
                     batch_images.clear()
@@ -203,6 +220,14 @@ class DocprocEngine:
             return self._build_result(raw_text="", normalized_text="", quality_flags=["failed"], error=str(e))
 
         full_text = "\n\n".join([p for p in pages_results if p]).strip()
+        if not self._has_meaningful_text(full_text):
+            return self._build_result(
+                raw_text="",
+                normalized_text="",
+                quality_flags=["vision_first", "sliding_window", "empty_vision_output"],
+                transcription_status="failed",
+                error="Vision extraction produced no readable content",
+            )
         return self._build_result(raw_text=full_text, normalized_text=full_text, quality_flags=["vision_first", "sliding_window"])
 
     def _vision_transcribe_page(self, image_b64: str, *, filename: str, page_number: int, hint: str | None = None) -> str:
@@ -278,8 +303,44 @@ class DocprocEngine:
     def _extract_docx_text(file_content: bytes, page_limit: int | None) -> str:
         try:
             doc = Document(io.BytesIO(file_content))
-            return "\n".join([p.text for p in doc.paragraphs if p.text])
+            parts = []
+            for section in doc.sections:
+                for paragraph in list(section.header.paragraphs) + list(section.footer.paragraphs):
+                    text = paragraph.text.strip()
+                    if text:
+                        parts.append(text)
+            for paragraph in doc.paragraphs:
+                text = paragraph.text.strip()
+                if text:
+                    parts.append(text)
+            for table_index, table in enumerate(doc.tables, start=1):
+                rows = []
+                for row in table.rows:
+                    cells = [cell.text.strip().replace("\n", " ") for cell in row.cells]
+                    if any(cells):
+                        rows.append("\t".join(cells))
+                if rows:
+                    parts.append(f"--- DOCX TABLE {table_index} ---")
+                    parts.extend(rows)
+            return "\n".join(parts)
         except: return ""
+
+    @staticmethod
+    def _clean_vision_text(text: str) -> str:
+        cleaned = (text or "").strip()
+        if cleaned.lower() in {"```markdown\n```", "```markdown```", "```", "``````"}:
+            return ""
+        if cleaned.startswith("```") and cleaned.endswith("```"):
+            inner = cleaned.strip("`").strip()
+            if inner.lower() in {"markdown", ""}:
+                return ""
+        return cleaned
+
+    @staticmethod
+    def _has_meaningful_text(text: str) -> bool:
+        cleaned = DocprocEngine._clean_vision_text(text)
+        alnum_count = sum(ch.isalnum() for ch in cleaned)
+        return alnum_count >= 3
 
     @staticmethod
     def _extract_pptx_text(file_content: bytes, page_limit: int | None) -> str:
