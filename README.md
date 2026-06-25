@@ -6,6 +6,7 @@ It is responsible for:
 - file-type-aware rendering and extraction
 - vision-first OCR for PDFs and images
 - richer Office processing for DOCX/PPTX/XLSX
+- native Outlook `.msg` email extraction
 - returning a normalized extraction payload to the backend
 
 ## Environment
@@ -86,4 +87,5 @@ Notes:
 - `DOCPROC_MAX_CONCURRENT_OCR` is the main guardrail that prevents document fanout from flooding the H100 with too many simultaneous vision requests.
 - By default, `DOCX` and `XLSX` use VM-side structured extraction only. `PPTX` keeps render+OCR enabled by default because slide layout matters more.
 - If you want LibreOffice rendering for `DOCX` or `XLSX`, set `DOCPROC_RENDER_DOCX=true` or `DOCPROC_RENDER_XLSX=true`.
+- Outlook `.msg` files are parsed natively with `extract-msg`. The output includes email headers, body text, and attachment names in `structured_data`; attachment contents are not recursively extracted.
 - The main backend should only know `DOC_PROCESSOR_URL`; this service is designed to be deployed independently from the Django app.

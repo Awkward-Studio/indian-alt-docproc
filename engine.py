@@ -2,9 +2,11 @@ import base64
 import contextlib
 import csv
 import hashlib
+import html as html_lib
 import io
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -141,6 +143,28 @@ class DocprocEngine:
                     )
                 text_export = ""
                 should_render = True
+
+            # 4. Outlook MSG Path
+            elif ext == ".msg":
+                logger.info(f"[{filename}] Using native Outlook MSG extraction path.")
+                msg_result = self._extract_msg_complete(file_content, filename=filename)
+                if msg_result.get("normalized_text"):
+                    return self._build_result(
+                        raw_text=msg_result["raw_extracted_text"],
+                        normalized_text=msg_result["normalized_text"],
+                        quality_flags=msg_result["quality_flags"],
+                        render_metadata=msg_result["render_metadata"],
+                        structured_data=msg_result["structured_data"],
+                    )
+                return self._build_result(
+                    raw_text="",
+                    normalized_text="",
+                    quality_flags=msg_result.get("quality_flags") or ["msg_native_failed"],
+                    render_metadata=msg_result.get("render_metadata") or {},
+                    structured_data=msg_result.get("structured_data") or {},
+                    error=msg_result.get("error") or "MSG extraction produced no readable content",
+                    transcription_status="failed",
+                )
 
             # Final Decision Logic
             if text_export.strip() and not should_render:
@@ -349,6 +373,201 @@ class DocprocEngine:
             prs = Presentation(io.BytesIO(file_content))
             return "\n".join([s.shapes[i].text for s in prs.slides for i in range(len(s.shapes)) if hasattr(s.shapes[i], "text")])
         except: return ""
+
+    def _extract_msg_complete(self, file_content: bytes, filename: str = "") -> dict[str, Any]:
+        digest = hashlib.sha256(file_content).hexdigest()
+        try:
+            import extract_msg
+        except Exception as exc:
+            return {
+                "raw_extracted_text": "",
+                "normalized_text": "",
+                "quality_flags": ["msg_native_failed", "missing_extract_msg_dependency"],
+                "render_metadata": {
+                    "route": "msg_native",
+                    "content_sha256": digest,
+                    "reader_error": str(exc),
+                },
+                "structured_data": {
+                    "kind": "email_message",
+                    "format": "msg",
+                    "filename": filename,
+                    "content_sha256": digest,
+                },
+                "error": f"extract-msg dependency unavailable: {exc}",
+            }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            msg_path = os.path.join(temp_dir, "message.msg")
+            with open(msg_path, "wb") as f:
+                f.write(file_content)
+
+            msg = None
+            try:
+                msg = extract_msg.Message(msg_path)
+                subject = self._clean_email_field(getattr(msg, "subject", None))
+                sender = self._clean_email_field(getattr(msg, "sender", None) or getattr(msg, "senderEmail", None))
+                to = self._clean_email_field(getattr(msg, "to", None))
+                cc = self._clean_email_field(getattr(msg, "cc", None))
+                bcc = self._clean_email_field(getattr(msg, "bcc", None))
+                date = self._clean_email_field(getattr(msg, "date", None))
+                message_id = self._clean_email_field(getattr(msg, "messageId", None))
+                body = self._clean_email_field(getattr(msg, "body", None))
+                html_body = getattr(msg, "htmlBody", None)
+                html_text = self._html_to_text(html_body)
+                body_text = body or html_text
+
+                attachments = []
+                for attachment in getattr(msg, "attachments", []) or []:
+                    att_name = (
+                        getattr(attachment, "longFilename", None)
+                        or getattr(attachment, "shortFilename", None)
+                        or getattr(attachment, "name", None)
+                        or ""
+                    )
+                    att_size = None
+                    data = getattr(attachment, "data", None)
+                    if isinstance(data, (bytes, bytearray)):
+                        att_size = len(data)
+                    attachments.append({
+                        "filename": self._clean_email_field(att_name),
+                        "size_bytes": att_size,
+                    })
+
+                parts = [f"# OUTLOOK MSG: {filename}", f"SHA256: {digest}", ""]
+                header_rows = [
+                    ("Subject", subject),
+                    ("From", sender),
+                    ("To", to),
+                    ("Cc", cc),
+                    ("Bcc", bcc),
+                    ("Date", date),
+                    ("Message-ID", message_id),
+                ]
+                for label, value in header_rows:
+                    if value:
+                        parts.append(f"{label}: {value}")
+                if attachments:
+                    parts.append("")
+                    parts.append("## Attachments")
+                    for index, attachment in enumerate(attachments, start=1):
+                        size = attachment.get("size_bytes")
+                        size_text = f" ({size} bytes)" if size is not None else ""
+                        parts.append(f"{index}. {attachment.get('filename') or 'Unnamed attachment'}{size_text}")
+                if body_text:
+                    parts.append("")
+                    parts.append("## Body")
+                    parts.append(body_text)
+
+                normalized_text = "\n".join(parts).strip()
+                meaningful_payload = "\n".join(value for value in (subject, sender, to, cc, bcc, date, body_text) if value)
+                if not self._has_meaningful_text(meaningful_payload):
+                    return {
+                        "raw_extracted_text": "",
+                        "normalized_text": "",
+                        "quality_flags": ["msg_native", "empty_msg_output"],
+                        "render_metadata": {
+                            "route": "msg_native",
+                            "content_sha256": digest,
+                            "attachment_count": len(attachments),
+                        },
+                        "structured_data": {
+                            "kind": "email_message",
+                            "format": "msg",
+                            "filename": filename,
+                            "content_sha256": digest,
+                            "subject": subject,
+                            "sender": sender,
+                            "to": to,
+                            "cc": cc,
+                            "bcc": bcc,
+                            "date": date,
+                            "message_id": message_id,
+                            "attachments": attachments,
+                        },
+                        "error": "MSG extraction produced no readable subject/body/header text",
+                    }
+
+                return {
+                    "raw_extracted_text": normalized_text,
+                    "normalized_text": normalized_text,
+                    "quality_flags": ["msg_native", "direct_text", "email_headers_extracted"],
+                    "render_metadata": {
+                        "route": "msg_native",
+                        "content_sha256": digest,
+                        "attachment_count": len(attachments),
+                        "body_chars": len(body_text or ""),
+                        "html_body_used": bool(html_text and not body),
+                    },
+                    "structured_data": {
+                        "kind": "email_message",
+                        "format": "msg",
+                        "filename": filename,
+                        "content_sha256": digest,
+                        "subject": subject,
+                        "sender": sender,
+                        "to": to,
+                        "cc": cc,
+                        "bcc": bcc,
+                        "date": date,
+                        "message_id": message_id,
+                        "attachments": attachments,
+                    },
+                }
+            except Exception as exc:
+                logger.warning(f"[{filename}] Native MSG extraction failed: {exc}")
+                return {
+                    "raw_extracted_text": "",
+                    "normalized_text": "",
+                    "quality_flags": ["msg_native_failed"],
+                    "render_metadata": {
+                        "route": "msg_native",
+                        "content_sha256": digest,
+                        "reader_error": str(exc),
+                    },
+                    "structured_data": {
+                        "kind": "email_message",
+                        "format": "msg",
+                        "filename": filename,
+                        "content_sha256": digest,
+                    },
+                    "error": str(exc),
+                }
+            finally:
+                if msg is not None:
+                    close = getattr(msg, "close", None)
+                    if callable(close):
+                        try:
+                            close()
+                        except Exception:
+                            pass
+
+    @staticmethod
+    def _clean_email_field(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, bytes):
+            for encoding in ("utf-8", "utf-16", "latin-1"):
+                try:
+                    value = value.decode(encoding)
+                    break
+                except Exception:
+                    continue
+            if isinstance(value, bytes):
+                value = value.decode("utf-8", errors="replace")
+        return str(value).replace("\x00", "").strip()
+
+    @classmethod
+    def _html_to_text(cls, html_body: Any) -> str:
+        html = cls._clean_email_field(html_body)
+        if not html:
+            return ""
+        html = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", html)
+        html = re.sub(r"(?i)<br\s*/?>", "\n", html)
+        html = re.sub(r"(?i)</p\s*>", "\n", html)
+        html = re.sub(r"(?s)<[^>]+>", " ", html)
+        html = html_lib.unescape(html)
+        return "\n".join(line.strip() for line in html.splitlines() if line.strip())
 
     def _extract_spreadsheet_complete(self, file_content: bytes, filename: str = "") -> dict[str, Any]:
         ext = os.path.splitext(filename)[1].lower()
