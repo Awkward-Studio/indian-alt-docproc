@@ -1,6 +1,6 @@
 # VM Document Processing Service
 
-This is a standalone FastAPI service intended to live outside the main `indian-alt` backend repo and run on the same VM as `vllm`.
+This is a standalone FastAPI service intended to live outside the main `indian-alt` backend repo and outside the H100 inference VM. Deploy it on CPU-only capacity and point Django at it with `DOC_PROCESSOR_URL`.
 
 It is responsible for:
 - file-type-aware rendering and extraction
@@ -47,7 +47,7 @@ docker run -d --name docproc \
   india-alt-docproc:latest
 ```
 
-## Docker Compose on the VM
+## Docker Compose on the CPU Service VM
 
 ```bash
 cd /path/to/indian-alt-docproc
@@ -83,9 +83,9 @@ Response JSON:
 ```
 
 Notes:
-- `docproc` renders and extracts on CPU/RAM; VRAM pressure comes from the OCR calls it makes into local `vLLM`.
+- `docproc` renders and extracts on CPU/RAM; keep it off the GPU VM so PDF and Office processing do not compete with vLLM/TEI for host CPU and I/O.
 - `DOCPROC_MAX_CONCURRENT_OCR` is the main guardrail that prevents document fanout from flooding the H100 with too many simultaneous vision requests.
 - By default, `DOCX` and `XLSX` use VM-side structured extraction only. `PPTX` keeps render+OCR enabled by default because slide layout matters more.
 - If you want LibreOffice rendering for `DOCX` or `XLSX`, set `DOCPROC_RENDER_DOCX=true` or `DOCPROC_RENDER_XLSX=true`.
 - Outlook `.msg` files are parsed natively with `extract-msg`. The output includes email headers, body text, and attachment names in `structured_data`; attachment contents are not recursively extracted.
-- The main backend should only know `DOC_PROCESSOR_URL`; this service is designed to be deployed independently from the Django app.
+- The main backend should only know `DOC_PROCESSOR_URL`; this service is designed to be deployed independently from the Django app and the inference stack.
