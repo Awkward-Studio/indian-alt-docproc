@@ -49,7 +49,7 @@ class DocprocEngine:
         self.config = config
         self._ocr_semaphore = threading.BoundedSemaphore(max(1, config.max_concurrent_ocr))
 
-    def stream_extract(self, *, file_content: bytes, filename: str, page_limit: int | None = None, hint: str | None = None) -> Generator[str, None, None]:
+    def stream_extract(self, *, file_content: bytes, filename: str, page_limit: int | None = None, hint: str | None = None, prompt: str | None = None) -> Generator[str, None, None]:
         """Generator that sends heartbeat spaces to keep the network connection alive."""
         # Start the conversion in a separate thread so we can send heartbeats
         result_container = {}
@@ -61,7 +61,8 @@ class DocprocEngine:
                     file_content=file_content, 
                     filename=filename, 
                     page_limit=page_limit,
-                    hint=hint
+                    hint=hint,
+                    prompt=prompt,
                 )
             except Exception as e:
                 result_container['error'] = str(e)
@@ -81,7 +82,7 @@ class DocprocEngine:
         else:
             yield json.dumps(result_container.get('data', {}))
 
-    def extract_document(self, *, file_content: bytes, filename: str, page_limit: int | None = None, hint: str | None = None) -> dict[str, Any]:
+    def extract_document(self, *, file_content: bytes, filename: str, page_limit: int | None = None, hint: str | None = None, prompt: str | None = None) -> dict[str, Any]:
         """Entry point for extraction."""
         ext = os.path.splitext(filename)[1].lower()
         
@@ -92,7 +93,7 @@ class DocprocEngine:
         try:
             if ext in {".png", ".jpg", ".jpeg", ".pdf"}:
                 logger.info(f"[{filename}] Using Vision Path (Direct/Sliding Window)")
-                return self._extract_via_vision(file_content=file_content, filename=filename, page_limit=limit, hint=hint)
+                return self._extract_via_vision(file_content=file_content, filename=filename, page_limit=limit, hint=hint, prompt=prompt)
             
             # Office Speed Path
             text_export = ""
@@ -181,7 +182,7 @@ class DocprocEngine:
 
             # 4. Fallback to rendering (PDF + Vision)
             logger.info(f"[{filename}] FALLBACK: Falling back to rendering path (should_render={should_render})")
-            rendered = self._render_office_to_pdf_and_extract(file_content, filename, limit, hint=hint)
+            rendered = self._render_office_to_pdf_and_extract(file_content, filename, limit, hint=hint, prompt=prompt)
             if rendered:
                 logger.info(f"[{filename}] Rendering success. Merging results.")
             else:
@@ -192,11 +193,11 @@ class DocprocEngine:
             logger.exception(f"Failure for {filename}")
             return self._build_result(raw_text="", normalized_text="", quality_flags=["crash"], error=str(e), transcription_status="failed")
 
-    def _extract_via_vision(self, *, file_content: bytes, filename: str, page_limit: int | None, hint: str | None = None) -> dict[str, Any]:
+    def _extract_via_vision(self, *, file_content: bytes, filename: str, page_limit: int | None, hint: str | None = None, prompt: str | None = None) -> dict[str, Any]:
         ext = os.path.splitext(filename)[1].lower()
         if ext in {".png", ".jpg", ".jpeg"}:
             img_b64 = self._optimize_and_encode(file_content)
-            text = self._clean_vision_text(self._vision_transcribe_page(img_b64, filename=filename, page_number=1, hint=hint))
+            text = self._clean_vision_text(self._vision_transcribe_page(img_b64, filename=filename, page_number=1, hint=hint, prompt=prompt))
             if not self._has_meaningful_text(text):
                 return self._build_result(
                     raw_text="",
@@ -226,7 +227,7 @@ class DocprocEngine:
                     batch_texts = [None] * len(batch_images)
                     with ThreadPoolExecutor(max_workers=self.config.max_concurrent_ocr) as executor:
                         future_to_idx = {
-                            executor.submit(self._vision_transcribe_page, img, filename=filename, page_number=start_idx+i+1, hint=hint): i 
+                            executor.submit(self._vision_transcribe_page, img, filename=filename, page_number=start_idx+i+1, hint=hint, prompt=prompt): i
                             for i, img in enumerate(batch_images)
                         }
                         for future in as_completed(future_to_idx):
@@ -255,7 +256,7 @@ class DocprocEngine:
             )
         return self._build_result(raw_text=full_text, normalized_text=full_text, quality_flags=["vision_first", "sliding_window"])
 
-    def _vision_transcribe_page(self, image_b64: str, *, filename: str, page_number: int, hint: str | None = None) -> str:
+    def _vision_transcribe_page(self, image_b64: str, *, filename: str, page_number: int, hint: str | None = None, prompt: str | None = None) -> str:
         headers = {"Content-Type": "application/json"}
         if self.config.vllm_api_key:
             headers["Authorization"] = f"Bearer {self.config.vllm_api_key}"
@@ -263,7 +264,7 @@ class DocprocEngine:
         base_url = self.config.vllm_base_url.rstrip("/")
         if not base_url.endswith("/v1"): base_url = f"{base_url}/v1"
             
-        base_prompt = "Extract all text and tabular data exactly. Output Markdown."
+        base_prompt = prompt or "Extract all text and tabular data exactly. Output Markdown."
         final_prompt = f"{hint}\n\n{base_prompt}" if hint else base_prompt
 
         with self._ocr_semaphore:
@@ -294,7 +295,7 @@ class DocprocEngine:
         img.save(output, format="PNG", optimize=True)
         return base64.b64encode(output.getvalue()).decode("utf-8")
 
-    def _render_office_to_pdf_and_extract(self, file_content: bytes, filename: str, page_limit: int | None, hint: str | None = None) -> dict[str, Any] | None:
+    def _render_office_to_pdf_and_extract(self, file_content: bytes, filename: str, page_limit: int | None, hint: str | None = None, prompt: str | None = None) -> dict[str, Any] | None:
         if not shutil.which("soffice"): return None
         ext = os.path.splitext(filename)[1].lower() or ".bin"
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -311,7 +312,7 @@ class DocprocEngine:
                 if not os.path.exists(pdf_p):
                     pdf_p = os.path.join(temp_dir, os.path.splitext(os.path.basename(in_p))[0] + ".pdf")
                 with open(pdf_p, "rb") as f: 
-                    return self._extract_via_vision(file_content=f.read(), filename=filename, page_limit=page_limit, hint=hint)
+                    return self._extract_via_vision(file_content=f.read(), filename=filename, page_limit=page_limit, hint=hint, prompt=prompt)
             except: return None
 
     def _merge_extraction_results(self, rendered, text_export, route, fallback_flag):

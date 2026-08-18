@@ -20,6 +20,7 @@ class ExtractDocumentRequest(BaseModel):
     page_limit: int | None = None
     start_page: int | None = 0
     hint: str | None = None
+    prompt: str | None = None
 
 @lru_cache()
 def get_engine():
@@ -71,6 +72,7 @@ async def extract_document(
             filename=request.filename,
             page_limit=request.page_limit,
             hint=request.hint,
+            prompt=request.prompt,
         ),
         media_type="application/x-ndjson"
     )
