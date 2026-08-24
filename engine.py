@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 class EngineConfig:
     vllm_base_url: str
     vllm_api_key: str
-    vision_model: str
+    text_model: str
     request_timeout: int = 600
     max_page_limit: int = 500
     max_concurrent_ocr: int = 96
@@ -43,11 +43,12 @@ class EngineConfig:
     render_docx: bool = True
     render_pptx: bool = True
     spreadsheet_chunk_rows: int = 200
+    normalization_chunk_chars: int = 12000
 
 class DocprocEngine:
     def __init__(self, config: EngineConfig):
         self.config = config
-        self._ocr_semaphore = threading.BoundedSemaphore(max(1, config.max_concurrent_ocr))
+        self._model_semaphore = threading.BoundedSemaphore(max(1, config.max_concurrent_ocr))
 
     def stream_extract(self, *, file_content: bytes, filename: str, page_limit: int | None = None, hint: str | None = None, prompt: str | None = None) -> Generator[str, None, None]:
         """Generator that sends heartbeat spaces to keep the network connection alive."""
@@ -83,6 +84,33 @@ class DocprocEngine:
             yield json.dumps(result_container.get('data', {}))
 
     def extract_document(self, *, file_content: bytes, filename: str, page_limit: int | None = None, hint: str | None = None, prompt: str | None = None) -> dict[str, Any]:
+        result = self._extract_document_raw(
+            file_content=file_content,
+            filename=filename,
+            page_limit=page_limit,
+            hint=hint,
+            prompt=prompt,
+        )
+        raw_text = str(result.get("raw_extracted_text") or result.get("normalized_text") or "").strip()
+        if not raw_text or result.get("transcription_status") == "failed":
+            return result
+        try:
+            normalized_text = self._normalize_extracted_text(raw_text, filename=filename)
+        except Exception as exc:
+            logger.warning("[%s] Text-model normalization failed: %s", filename, exc)
+            result["normalized_text"] = raw_text
+            result["quality_flags"] = [*(result.get("quality_flags") or []), "model_normalization_failed"]
+            result["render_metadata"] = {
+                **(result.get("render_metadata") or {}),
+                "normalization_error": str(exc),
+            }
+            return result
+        if normalized_text:
+            result["normalized_text"] = normalized_text
+            result["quality_flags"] = [*(result.get("quality_flags") or []), "text_model_normalized"]
+        return result
+
+    def _extract_document_raw(self, *, file_content: bytes, filename: str, page_limit: int | None = None, hint: str | None = None, prompt: str | None = None) -> dict[str, Any]:
         """Entry point for extraction."""
         ext = os.path.splitext(filename)[1].lower()
         
@@ -92,8 +120,8 @@ class DocprocEngine:
         logger.info(f"--- START EXTRACTION: {filename} (Ext: {ext}) ---")
         try:
             if ext in {".png", ".jpg", ".jpeg", ".pdf"}:
-                logger.info(f"[{filename}] Using Vision Path (Direct/Sliding Window)")
-                return self._extract_via_vision(file_content=file_content, filename=filename, page_limit=limit, hint=hint, prompt=prompt)
+                logger.info(f"[{filename}] Using multimodal text-model path")
+                return self._extract_via_multimodal(file_content=file_content, filename=filename, page_limit=limit, hint=hint, prompt=prompt)
             
             # Office Speed Path
             text_export = ""
@@ -180,7 +208,7 @@ class DocprocEngine:
                 logger.warning(f"[{filename}] FAILED: Text extraction failed and rendering is disabled.")
                 return self._build_result(raw_text="", normalized_text="", quality_flags=["failed_text_no_render"], error="Text extraction failed and rendering is disabled for this type")
 
-            # 4. Fallback to rendering (PDF + Vision)
+            # 4. Fallback to rendering and the shared multimodal model
             logger.info(f"[{filename}] FALLBACK: Falling back to rendering path (should_render={should_render})")
             rendered = self._render_office_to_pdf_and_extract(file_content, filename, limit, hint=hint, prompt=prompt)
             if rendered:
@@ -193,20 +221,20 @@ class DocprocEngine:
             logger.exception(f"Failure for {filename}")
             return self._build_result(raw_text="", normalized_text="", quality_flags=["crash"], error=str(e), transcription_status="failed")
 
-    def _extract_via_vision(self, *, file_content: bytes, filename: str, page_limit: int | None, hint: str | None = None, prompt: str | None = None) -> dict[str, Any]:
+    def _extract_via_multimodal(self, *, file_content: bytes, filename: str, page_limit: int | None, hint: str | None = None, prompt: str | None = None) -> dict[str, Any]:
         ext = os.path.splitext(filename)[1].lower()
         if ext in {".png", ".jpg", ".jpeg"}:
             img_b64 = self._optimize_and_encode(file_content)
-            text = self._clean_vision_text(self._vision_transcribe_page(img_b64, filename=filename, page_number=1, hint=hint, prompt=prompt))
+            text = self._clean_model_text(self._multimodal_transcribe_page(img_b64, filename=filename, page_number=1, hint=hint, prompt=prompt))
             if not self._has_meaningful_text(text):
                 return self._build_result(
                     raw_text="",
                     normalized_text="",
-                    quality_flags=["vision_first", "empty_vision_output"],
+                    quality_flags=["multimodal_model", "empty_model_output"],
                     transcription_status="failed",
-                    error="Vision extraction produced no readable content",
+                    error="Multimodal extraction produced no readable content",
                 )
-            return self._build_result(raw_text=text, normalized_text=text, quality_flags=["vision_first"])
+            return self._build_result(raw_text=text, normalized_text=text, quality_flags=["multimodal_model"])
 
         pages_results = []
         try:
@@ -227,12 +255,12 @@ class DocprocEngine:
                     batch_texts = [None] * len(batch_images)
                     with ThreadPoolExecutor(max_workers=self.config.max_concurrent_ocr) as executor:
                         future_to_idx = {
-                            executor.submit(self._vision_transcribe_page, img, filename=filename, page_number=start_idx+i+1, hint=hint, prompt=prompt): i
+                            executor.submit(self._multimodal_transcribe_page, img, filename=filename, page_number=start_idx+i+1, hint=hint, prompt=prompt): i
                             for i, img in enumerate(batch_images)
                         }
                         for future in as_completed(future_to_idx):
                             idx = future_to_idx[future]
-                            page_text = self._clean_vision_text(future.result())
+                            page_text = self._clean_model_text(future.result())
                             if self._has_meaningful_text(page_text):
                                 batch_texts[idx] = f"--- {filename} (PAGE {start_idx+idx+1}) ---\n{page_text}"
                     
@@ -250,13 +278,13 @@ class DocprocEngine:
             return self._build_result(
                 raw_text="",
                 normalized_text="",
-                quality_flags=["vision_first", "sliding_window", "empty_vision_output"],
+                quality_flags=["multimodal_model", "sliding_window", "empty_model_output"],
                 transcription_status="failed",
-                error="Vision extraction produced no readable content",
+                error="Multimodal extraction produced no readable content",
             )
-        return self._build_result(raw_text=full_text, normalized_text=full_text, quality_flags=["vision_first", "sliding_window"])
+        return self._build_result(raw_text=full_text, normalized_text=full_text, quality_flags=["multimodal_model", "sliding_window"])
 
-    def _vision_transcribe_page(self, image_b64: str, *, filename: str, page_number: int, hint: str | None = None, prompt: str | None = None) -> str:
+    def _multimodal_transcribe_page(self, image_b64: str, *, filename: str, page_number: int, hint: str | None = None, prompt: str | None = None) -> str:
         headers = {"Content-Type": "application/json"}
         if self.config.vllm_api_key:
             headers["Authorization"] = f"Bearer {self.config.vllm_api_key}"
@@ -267,17 +295,53 @@ class DocprocEngine:
         base_prompt = prompt or "Extract all text and tabular data exactly. Output Markdown."
         final_prompt = f"{hint}\n\n{base_prompt}" if hint else base_prompt
 
-        with self._ocr_semaphore:
+        with self._model_semaphore:
             response = requests.post(
                 f"{base_url}/chat/completions",
                 headers=headers,
                 json={
-                    "model": self.config.vision_model,
+                    "model": self.config.text_model,
                     "messages": [{"role": "user", "content": [
                         {"type": "text", "text": final_prompt},
                         {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}}
                     ]}],
                     "temperature": 0.1,
+                    "max_tokens": 4000,
+                },
+                timeout=self.config.request_timeout,
+            )
+        response.raise_for_status()
+        return response.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+
+    def _normalize_extracted_text(self, text: str, *, filename: str) -> str:
+        chunk_size = max(1000, self.config.normalization_chunk_chars)
+        chunks = [text[start:start + chunk_size] for start in range(0, len(text), chunk_size)]
+        normalized_chunks = []
+        for index, chunk in enumerate(chunks, start=1):
+            prompt = (
+                "Normalize the extracted document text below into faithful Markdown. Preserve every fact, "
+                "number, page marker, heading, and table value. Do not summarize, infer, or add commentary. "
+                f"Document: {filename}. Part {index} of {len(chunks)}.\n\n{chunk}"
+            )
+            normalized = self._text_completion(prompt)
+            normalized_chunks.append(normalized or chunk)
+        return "\n\n".join(normalized_chunks).strip()
+
+    def _text_completion(self, prompt: str) -> str:
+        headers = {"Content-Type": "application/json"}
+        if self.config.vllm_api_key:
+            headers["Authorization"] = f"Bearer {self.config.vllm_api_key}"
+        base_url = self.config.vllm_base_url.rstrip("/")
+        if not base_url.endswith("/v1"):
+            base_url = f"{base_url}/v1"
+        with self._model_semaphore:
+            response = requests.post(
+                f"{base_url}/chat/completions",
+                headers=headers,
+                json={
+                    "model": self.config.text_model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.0,
                     "max_tokens": 4000,
                 },
                 timeout=self.config.request_timeout,
@@ -312,7 +376,7 @@ class DocprocEngine:
                 if not os.path.exists(pdf_p):
                     pdf_p = os.path.join(temp_dir, os.path.splitext(os.path.basename(in_p))[0] + ".pdf")
                 with open(pdf_p, "rb") as f: 
-                    return self._extract_via_vision(file_content=f.read(), filename=filename, page_limit=page_limit, hint=hint, prompt=prompt)
+                    return self._extract_via_multimodal(file_content=f.read(), filename=filename, page_limit=page_limit, hint=hint, prompt=prompt)
             except: return None
 
     def _merge_extraction_results(self, rendered, text_export, route, fallback_flag):
@@ -352,7 +416,7 @@ class DocprocEngine:
         except: return ""
 
     @staticmethod
-    def _clean_vision_text(text: str) -> str:
+    def _clean_model_text(text: str) -> str:
         cleaned = (text or "").strip()
         if cleaned.lower() in {"```markdown\n```", "```markdown```", "```", "``````"}:
             return ""
@@ -364,7 +428,7 @@ class DocprocEngine:
 
     @staticmethod
     def _has_meaningful_text(text: str) -> bool:
-        cleaned = DocprocEngine._clean_vision_text(text)
+        cleaned = DocprocEngine._clean_model_text(text)
         alnum_count = sum(ch.isalnum() for ch in cleaned)
         return alnum_count >= 3
 

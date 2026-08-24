@@ -4,20 +4,22 @@ This is a standalone FastAPI service intended to live outside the main `indian-a
 
 It is responsible for:
 - file-type-aware rendering and extraction
-- vision-first OCR for PDFs and images
+- multimodal transcription for PDFs and images using the shared text model
 - richer Office processing for DOCX/PPTX/XLSX
 - native Outlook `.msg` email extraction
+- text-only normalization using the same model after extraction
 - returning a normalized extraction payload to the backend
 
 ## Environment
 
 - `VLLM_BASE_URL`
 - `VLLM_API_KEY`
-- `VLLM_VISION_MODEL`
+- `VLLM_TEXT_MODEL`
 - `DOCPROC_API_KEY`
 - `DOCPROC_MAX_PAGE_LIMIT`
 - `DOCPROC_REQUEST_TIMEOUT`
 - `DOCPROC_MAX_CONCURRENT_OCR`
+- `DOCPROC_NORMALIZATION_CHUNK_CHARS`
 - `DOCPROC_OFFICE_RENDER_TIMEOUT`
 - `DOCPROC_RENDER_DOCX`
 - `DOCPROC_RENDER_PPTX`
@@ -83,9 +85,9 @@ Response JSON:
 ```
 
 Notes:
-- `docproc` renders and extracts on CPU/RAM; keep it off the GPU VM so PDF and Office processing do not compete with vLLM/TEI for host CPU and I/O.
-- `DOCPROC_MAX_CONCURRENT_OCR` is the main guardrail that prevents document fanout from flooding the H100 with too many simultaneous vision requests.
-- By default, `DOCX` and `XLSX` use VM-side structured extraction only. `PPTX` keeps render+OCR enabled by default because slide layout matters more.
+- `docproc` can run beside the shared multimodal model. Rendering uses CPU/RAM and model calls use the configured OpenAI-compatible endpoint.
+- `DOCPROC_MAX_CONCURRENT_OCR` limits concurrent multimodal and normalization requests. Use `1` on the T4 profile.
+- Native readers extract Office and spreadsheet text first. Gemma then normalizes the extracted text without replacing the raw result.
 - If you want LibreOffice rendering for `DOCX` or `XLSX`, set `DOCPROC_RENDER_DOCX=true` or `DOCPROC_RENDER_XLSX=true`.
 - Outlook `.msg` files are parsed natively with `extract-msg`. The output includes email headers, body text, and attachment names in `structured_data`; attachment contents are not recursively extracted.
-- The main backend should only know `DOC_PROCESSOR_URL`; this service is designed to be deployed independently from the Django app and the inference stack.
+- The main backend should only know `DOC_PROCESSOR_URL`. The T4 compose profile publishes docproc on port `8100`.
