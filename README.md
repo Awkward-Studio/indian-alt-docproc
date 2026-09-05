@@ -4,10 +4,10 @@ This is a standalone FastAPI service intended to live outside the main `indian-a
 
 It is responsible for:
 - file-type-aware rendering and extraction
-- multimodal transcription for PDFs and images using the shared text model
+- PDF/image transcription through a dedicated OCR model
 - richer Office processing for DOCX/PPTX/XLSX
 - native Outlook `.msg` email extraction
-- text-only normalization using the same model after extraction
+- text-only normalization through a separate text model after extraction
 - returning a normalized extraction payload to the backend
 
 ## Environment
@@ -15,11 +15,14 @@ It is responsible for:
 - `VLLM_BASE_URL`
 - `VLLM_API_KEY`
 - `VLLM_TEXT_MODEL`
+- `VLLM_OCR_BASE_URL`
+- `VLLM_OCR_MODEL`
 - `DOCPROC_API_KEY`
 - `DOCPROC_MAX_PAGE_LIMIT`
 - `DOCPROC_REQUEST_TIMEOUT`
 - `DOCPROC_MAX_CONCURRENT_OCR`
 - `DOCPROC_NORMALIZATION_CHUNK_CHARS`
+- `DOCPROC_OCR_MAX_TOKENS`
 - `DOCPROC_OFFICE_RENDER_TIMEOUT`
 - `DOCPROC_RENDER_DOCX`
 - `DOCPROC_RENDER_PPTX`
@@ -85,9 +88,11 @@ Response JSON:
 ```
 
 Notes:
-- `docproc` can run beside the shared multimodal model. Rendering uses CPU/RAM and model calls use the configured OpenAI-compatible endpoint.
-- `DOCPROC_MAX_CONCURRENT_OCR` limits concurrent multimodal and normalization requests. Use `1` on the T4 profile.
-- Native readers extract Office and spreadsheet text first. Gemma then normalizes the extracted text without replacing the raw result.
+- `docproc` sends rendered pages to `VLLM_OCR_BASE_URL` and normalization to `VLLM_BASE_URL`.
+- The H100 profile uses `baidu/Unlimited-OCR` for page OCR and `Qwen/Qwen3.8-27B` for text normalization and downstream analysis.
+- `DOCPROC_MAX_CONCURRENT_OCR` limits concurrent OCR page requests. Text normalization uses the independent text server.
+- Native readers extract Office and spreadsheet text first. Qwen then normalizes the extracted text without replacing the raw result.
+- Unlimited-OCR requests include its required `<image>` prefix, no-repeat n-gram arguments, and special-token cleanup.
 - If you want LibreOffice rendering for `DOCX` or `XLSX`, set `DOCPROC_RENDER_DOCX=true` or `DOCPROC_RENDER_XLSX=true`.
 - Outlook `.msg` files are parsed natively with `extract-msg`. The output includes email headers, body text, and attachment names in `structured_data`; attachment contents are not recursively extracted.
 - The main backend should only know `DOC_PROCESSOR_URL`. The T4 compose profile publishes docproc on port `8100`.

@@ -34,6 +34,8 @@ class EngineConfig:
     vllm_base_url: str
     vllm_api_key: str
     text_model: str
+    ocr_base_url: str = ""
+    ocr_model: str = ""
     request_timeout: int = 600
     max_page_limit: int = 500
     max_concurrent_ocr: int = 96
@@ -44,11 +46,12 @@ class EngineConfig:
     render_pptx: bool = True
     spreadsheet_chunk_rows: int = 200
     normalization_chunk_chars: int = 12000
+    ocr_max_tokens: int = 8192
 
 class DocprocEngine:
     def __init__(self, config: EngineConfig):
         self.config = config
-        self._model_semaphore = threading.BoundedSemaphore(max(1, config.max_concurrent_ocr))
+        self._ocr_semaphore = threading.BoundedSemaphore(max(1, config.max_concurrent_ocr))
 
     def stream_extract(self, *, file_content: bytes, filename: str, page_limit: int | None = None, hint: str | None = None, prompt: str | None = None) -> Generator[str, None, None]:
         """Generator that sends heartbeat spaces to keep the network connection alive."""
@@ -289,25 +292,38 @@ class DocprocEngine:
         if self.config.vllm_api_key:
             headers["Authorization"] = f"Bearer {self.config.vllm_api_key}"
         
-        base_url = self.config.vllm_base_url.rstrip("/")
+        base_url = (self.config.ocr_base_url or self.config.vllm_base_url).rstrip("/")
         if not base_url.endswith("/v1"): base_url = f"{base_url}/v1"
-            
-        base_prompt = prompt or "Extract all text and tabular data exactly. Output Markdown."
-        final_prompt = f"{hint}\n\n{base_prompt}" if hint else base_prompt
 
-        with self._model_semaphore:
+        base_prompt = prompt or "document parsing."
+        requested_prompt = f"{hint}\n\n{base_prompt}" if hint else base_prompt
+        ocr_model = self.config.ocr_model or self.config.text_model
+        unlimited_ocr = "unlimited-ocr" in ocr_model.lower()
+        # Unlimited-OCR has no chat template. Its literal <image> prefix and
+        # per-request n-gram settings are required by the official recipe.
+        final_prompt = requested_prompt
+        if unlimited_ocr and not final_prompt.startswith("<image>"):
+            final_prompt = f"<image>{final_prompt}"
+        payload = {
+            "model": ocr_model,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": final_prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}}
+            ]}],
+            "temperature": 0.0,
+            "max_tokens": self.config.ocr_max_tokens,
+        }
+        if unlimited_ocr:
+            payload.update({
+                "skip_special_tokens": False,
+                "vllm_xargs": {"ngram_size": 35, "window_size": 128},
+            })
+
+        with self._ocr_semaphore:
             response = requests.post(
                 f"{base_url}/chat/completions",
                 headers=headers,
-                json={
-                    "model": self.config.text_model,
-                    "messages": [{"role": "user", "content": [
-                        {"type": "text", "text": final_prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}}
-                    ]}],
-                    "temperature": 0.1,
-                    "max_tokens": 4000,
-                },
+                json=payload,
                 timeout=self.config.request_timeout,
             )
         response.raise_for_status()
@@ -334,18 +350,18 @@ class DocprocEngine:
         base_url = self.config.vllm_base_url.rstrip("/")
         if not base_url.endswith("/v1"):
             base_url = f"{base_url}/v1"
-        with self._model_semaphore:
-            response = requests.post(
-                f"{base_url}/chat/completions",
-                headers=headers,
-                json={
-                    "model": self.config.text_model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.0,
-                    "max_tokens": 4000,
-                },
-                timeout=self.config.request_timeout,
-            )
+        response = requests.post(
+            f"{base_url}/chat/completions",
+            headers=headers,
+            json={
+                "model": self.config.text_model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.0,
+                "max_tokens": 4000,
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+            timeout=self.config.request_timeout,
+        )
         response.raise_for_status()
         return response.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
 
@@ -418,6 +434,10 @@ class DocprocEngine:
     @staticmethod
     def _clean_model_text(text: str) -> str:
         cleaned = (text or "").strip()
+        # Unlimited-OCR emits grounding labels and coordinate boxes. Preserve
+        # the label text while removing coordinates from the Markdown output.
+        cleaned = re.sub(r"<\|det\|>.*?<\|/det\|>", "", cleaned, flags=re.DOTALL)
+        cleaned = re.sub(r"<\|ref\|>(.*?)<\|/ref\|>", r"\1", cleaned, flags=re.DOTALL)
         if cleaned.lower() in {"```markdown\n```", "```markdown```", "```", "``````"}:
             return ""
         if cleaned.startswith("```") and cleaned.endswith("```"):

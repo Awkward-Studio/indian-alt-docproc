@@ -28,6 +28,8 @@ def get_engine():
         vllm_base_url=os.getenv("VLLM_BASE_URL", "http://127.0.0.1:8000/v1"),
         vllm_api_key=os.getenv("VLLM_API_KEY", ""),
         text_model=os.getenv("VLLM_TEXT_MODEL", ""),
+        ocr_base_url=os.getenv("VLLM_OCR_BASE_URL", os.getenv("VLLM_BASE_URL", "http://127.0.0.1:8000/v1")),
+        ocr_model=os.getenv("VLLM_OCR_MODEL", os.getenv("VLLM_TEXT_MODEL", "")),
         request_timeout=int(os.getenv("DOCPROC_REQUEST_TIMEOUT", "600")),
         max_page_limit=int(os.getenv("DOCPROC_MAX_PAGE_LIMIT", "500")),
         max_concurrent_ocr=int(os.getenv("DOCPROC_MAX_CONCURRENT_OCR", "128")),
@@ -38,6 +40,7 @@ def get_engine():
         render_pptx=os.getenv("DOCPROC_RENDER_PPTX", "true").lower() == "true",
         spreadsheet_chunk_rows=int(os.getenv("DOCPROC_SPREADSHEET_CHUNK_ROWS", "200")),
         normalization_chunk_chars=int(os.getenv("DOCPROC_NORMALIZATION_CHUNK_CHARS", "12000")),
+        ocr_max_tokens=int(os.getenv("DOCPROC_OCR_MAX_TOKENS", "8192")),
     )
     if not config.text_model:
         raise RuntimeError("VLLM_TEXT_MODEL is required for document transcription and normalization")
@@ -50,7 +53,8 @@ def health():
         engine = get_engine()
         return {
             "status": "ok",
-            "model": engine.config.text_model,
+            "text_model": engine.config.text_model,
+            "ocr_model": engine.config.ocr_model,
             "max_concurrent_model_requests": engine.config.max_concurrent_ocr,
         }
     except Exception as e:
