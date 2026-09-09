@@ -122,7 +122,31 @@ class DocprocEngine:
         
         logger.info(f"--- START EXTRACTION: {filename} (Ext: {ext}) ---")
         try:
-            if ext in {".png", ".jpg", ".jpeg", ".pdf"}:
+            if ext == ".pdf":
+                native = self._extract_pdf_native(file_content, page_limit=limit, filename=filename)
+                if native:
+                    logger.info(f"[{filename}] SUCCESS: Returning native PDF text.")
+                    return native
+                if self._uses_shared_text_endpoint_for_ocr():
+                    return self._build_result(
+                        raw_text="",
+                        normalized_text="",
+                        quality_flags=["pdf_image_only", "dedicated_ocr_required"],
+                        error="Image-only PDF requires a dedicated OCR endpoint.",
+                        transcription_status="failed",
+                    )
+                logger.info(f"[{filename}] Using dedicated multimodal OCR path")
+                return self._extract_via_multimodal(file_content=file_content, filename=filename, page_limit=limit, hint=hint, prompt=prompt)
+
+            if ext in {".png", ".jpg", ".jpeg"}:
+                if self._uses_shared_text_endpoint_for_ocr():
+                    return self._build_result(
+                        raw_text="",
+                        normalized_text="",
+                        quality_flags=["image_document", "dedicated_ocr_required"],
+                        error="Image document requires a dedicated OCR endpoint.",
+                        transcription_status="failed",
+                    )
                 logger.info(f"[{filename}] Using multimodal text-model path")
                 return self._extract_via_multimodal(file_content=file_content, filename=filename, page_limit=limit, hint=hint, prompt=prompt)
             
@@ -223,6 +247,36 @@ class DocprocEngine:
         except Exception as e:
             logger.exception(f"Failure for {filename}")
             return self._build_result(raw_text="", normalized_text="", quality_flags=["crash"], error=str(e), transcription_status="failed")
+
+    def _uses_shared_text_endpoint_for_ocr(self) -> bool:
+        text_url = self.config.vllm_base_url.rstrip("/")
+        ocr_url = (self.config.ocr_base_url or self.config.vllm_base_url).rstrip("/")
+        return text_url == ocr_url
+
+    def _extract_pdf_native(self, file_content: bytes, *, page_limit: int | None, filename: str) -> dict[str, Any] | None:
+        sections = []
+        empty_pages = []
+        with fitz.open(stream=file_content, filetype="pdf") as document:
+            limit = min(page_limit, len(document)) if page_limit else len(document)
+            for index in range(limit):
+                text = document[index].get_text().strip()
+                if text:
+                    sections.append(f"--- {filename} (PAGE {index + 1}) ---\n{text}")
+                else:
+                    empty_pages.append(index + 1)
+        full_text = "\n\n".join(sections).strip()
+        if not self._has_meaningful_text(full_text):
+            return None
+        flags = ["direct_text", "pdf_native", "no_render"]
+        if empty_pages:
+            flags.append(f"Pages without native text were not interpreted: {','.join(map(str, empty_pages))}")
+        return self._build_result(
+            raw_text=full_text,
+            normalized_text=full_text,
+            quality_flags=flags,
+            transcription_status="partial" if empty_pages else "complete",
+            render_metadata={"native_text_pages": len(sections), "unreadable_pages": empty_pages},
+        )
 
     def _extract_via_multimodal(self, *, file_content: bytes, filename: str, page_limit: int | None, hint: str | None = None, prompt: str | None = None) -> dict[str, Any]:
         ext = os.path.splitext(filename)[1].lower()

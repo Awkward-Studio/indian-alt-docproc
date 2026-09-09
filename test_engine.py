@@ -1,6 +1,8 @@
 import unittest
 from unittest.mock import MagicMock, patch
 
+import fitz
+
 from engine import DocprocEngine, EngineConfig
 
 
@@ -84,6 +86,46 @@ class DocprocEngineModelTests(unittest.TestCase):
         self.assertEqual(result["raw_extracted_text"], "Original table text")
         self.assertEqual(result["normalized_text"], "Original table text")
         self.assertIn("model_normalization_failed", result["quality_flags"])
+
+    def test_pdf_with_native_text_never_calls_vision(self):
+        document = fitz.open()
+        page = document.new_page()
+        page.insert_text((72, 72), "Class24 funding and operating evidence")
+        content = document.tobytes()
+        document.close()
+        self.engine._extract_via_multimodal = MagicMock()
+
+        result = self.engine._extract_document_raw(
+            file_content=content,
+            filename="pitch.pdf",
+        )
+
+        self.assertIn("Class24 funding", result["normalized_text"])
+        self.assertIn("pdf_native", result["quality_flags"])
+        self.engine._extract_via_multimodal.assert_not_called()
+
+    def test_image_only_pdf_is_not_sent_to_shared_text_server(self):
+        engine = DocprocEngine(EngineConfig(
+            vllm_base_url="http://gemma:8000/v1",
+            vllm_api_key="test-key",
+            text_model="gemma-4-12b-it-q8",
+            ocr_base_url="http://gemma:8000/v1",
+            ocr_model="gemma-4-12b-it-q8",
+        ))
+        document = fitz.open()
+        document.new_page()
+        content = document.tobytes()
+        document.close()
+        engine._extract_via_multimodal = MagicMock()
+
+        result = engine._extract_document_raw(
+            file_content=content,
+            filename="scan.pdf",
+        )
+
+        self.assertEqual(result["transcription_status"], "failed")
+        self.assertIn("dedicated_ocr_required", result["quality_flags"])
+        engine._extract_via_multimodal.assert_not_called()
 
 
 if __name__ == "__main__":
