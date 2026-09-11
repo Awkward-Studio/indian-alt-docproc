@@ -1,5 +1,4 @@
 import base64
-import contextlib
 import csv
 import hashlib
 import html as html_lib
@@ -14,6 +13,9 @@ import threading
 import time
 import gc
 import json
+import zipfile
+from email import policy
+from email.parser import BytesParser
 from dataclasses import dataclass
 from typing import Any, Generator
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -38,7 +40,7 @@ class EngineConfig:
     ocr_model: str = ""
     request_timeout: int = 600
     max_page_limit: int = 500
-    max_concurrent_ocr: int = 96
+    max_concurrent_ocr: int = 1
     office_render_timeout: int = 600
     sliding_window_size: int = 50
     render_xlsx: bool = False
@@ -47,11 +49,28 @@ class EngineConfig:
     spreadsheet_chunk_rows: int = 200
     normalization_chunk_chars: int = 12000
     ocr_max_tokens: int = 8192
+    normalize_with_model: bool = False
+    max_nonempty_cells: int = 1_000_000
+    max_sheets: int = 250
+    max_extracted_chars: int = 20_000_000
+    max_msg_depth: int = 3
+    max_msg_attachments: int = 50
+    max_msg_attachment_bytes: int = 100 * 1024 * 1024
 
 class DocprocEngine:
+    SUPPORTED_EXTENSIONS = {
+        ".pdf",
+        ".docx", ".docm", ".dotx", ".dotm", ".doc", ".odt", ".rtf",
+        ".pptx", ".pptm", ".ppsx", ".ppsm", ".potx", ".potm", ".ppt", ".odp",
+        ".xlsx", ".xlsm", ".xltx", ".xltm", ".xls", ".xlsb", ".xla", ".xlam", ".ods",
+        ".csv", ".tsv", ".txt", ".md", ".json", ".xml", ".html", ".htm", ".msg", ".eml",
+    }
+
     def __init__(self, config: EngineConfig):
         self.config = config
         self._ocr_semaphore = threading.BoundedSemaphore(max(1, config.max_concurrent_ocr))
+        self._extraction_semaphore = threading.BoundedSemaphore(1)
+        self._office_semaphore = threading.BoundedSemaphore(1)
 
     def stream_extract(self, *, file_content: bytes, filename: str, page_limit: int | None = None, hint: str | None = None, prompt: str | None = None) -> Generator[str, None, None]:
         """Generator that sends heartbeat spaces to keep the network connection alive."""
@@ -61,13 +80,14 @@ class DocprocEngine:
 
         def run_extraction():
             try:
-                result_container['data'] = self.extract_document(
-                    file_content=file_content, 
-                    filename=filename, 
-                    page_limit=page_limit,
-                    hint=hint,
-                    prompt=prompt,
-                )
+                with self._extraction_semaphore:
+                    result_container['data'] = self.extract_document(
+                        file_content=file_content,
+                        filename=filename,
+                        page_limit=page_limit,
+                        hint=hint,
+                        prompt=prompt,
+                    )
             except Exception as e:
                 result_container['error'] = str(e)
             finally:
@@ -84,7 +104,7 @@ class DocprocEngine:
         if 'error' in result_container:
             yield json.dumps({"error": result_container['error'], "status": "failed"})
         else:
-            yield json.dumps(result_container.get('data', {}))
+            yield json.dumps(result_container.get('data', {}), default=str)
 
     def extract_document(self, *, file_content: bytes, filename: str, page_limit: int | None = None, hint: str | None = None, prompt: str | None = None) -> dict[str, Any]:
         result = self._extract_document_raw(
@@ -97,20 +117,21 @@ class DocprocEngine:
         raw_text = str(result.get("raw_extracted_text") or result.get("normalized_text") or "").strip()
         if not raw_text or result.get("transcription_status") == "failed":
             return result
-        try:
-            normalized_text = self._normalize_extracted_text(raw_text, filename=filename)
-        except Exception as exc:
-            logger.warning("[%s] Text-model normalization failed: %s", filename, exc)
-            result["normalized_text"] = raw_text
-            result["quality_flags"] = [*(result.get("quality_flags") or []), "model_normalization_failed"]
-            result["render_metadata"] = {
-                **(result.get("render_metadata") or {}),
-                "normalization_error": str(exc),
-            }
-            return result
-        if normalized_text:
-            result["normalized_text"] = normalized_text
-            result["quality_flags"] = [*(result.get("quality_flags") or []), "text_model_normalized"]
+        if self.config.normalize_with_model:
+            try:
+                normalized_text = self._normalize_extracted_text(raw_text, filename=filename)
+            except Exception as exc:
+                logger.warning("[%s] Text-model normalization failed: %s", filename, exc)
+                result["normalized_text"] = raw_text
+                result["quality_flags"] = [*(result.get("quality_flags") or []), "model_normalization_failed"]
+                result["render_metadata"] = {
+                    **(result.get("render_metadata") or {}),
+                    "normalization_error": str(exc),
+                }
+                return result
+            if normalized_text:
+                result["normalized_text"] = normalized_text
+                result["quality_flags"] = [*(result.get("quality_flags") or []), "text_model_normalized"]
         return result
 
     def _extract_document_raw(self, *, file_content: bytes, filename: str, page_limit: int | None = None, hint: str | None = None, prompt: str | None = None) -> dict[str, Any]:
@@ -138,7 +159,7 @@ class DocprocEngine:
                 logger.info(f"[{filename}] Using dedicated multimodal OCR path")
                 return self._extract_via_multimodal(file_content=file_content, filename=filename, page_limit=limit, hint=hint, prompt=prompt)
 
-            if ext in {".png", ".jpg", ".jpeg"}:
+            if ext in {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}:
                 if self._uses_shared_text_endpoint_for_ocr():
                     return self._build_result(
                         raw_text="",
@@ -150,17 +171,28 @@ class DocprocEngine:
                 logger.info(f"[{filename}] Using multimodal text-model path")
                 return self._extract_via_multimodal(file_content=file_content, filename=filename, page_limit=limit, hint=hint, prompt=prompt)
             
+            if ext in {".txt", ".md", ".json", ".xml", ".html", ".htm"}:
+                decoded = self._decode_text(file_content)
+                if ext in {".html", ".htm"}:
+                    decoded = self._html_to_text(decoded)
+                return self._build_result(
+                    raw_text=decoded,
+                    normalized_text=decoded,
+                    quality_flags=["direct_text", "safe_text_decode"],
+                    structured_data={"kind": "text", "format": ext.lstrip("."), "filename": filename},
+                )
+
             # Office Speed Path
             text_export = ""
             should_render = True
             
             # 1. DOCX Path
-            if ext in {".docx", ".doc", ".odt"}: 
+            if ext in {".docx", ".docm", ".dotx", ".dotm", ".doc", ".odt", ".rtf"}:
                 logger.info(f"[{filename}] Attempting Word/Doc text extraction...")
                 text_export = self._extract_docx_text(file_content, limit)
                 should_render = self.config.render_docx
                 logger.info(f"[{filename}] Word extraction complete. Chars: {len(text_export)}, should_render: {should_render}")
-                if ext == ".docx" and self._has_meaningful_text(text_export):
+                if ext in {".docx", ".docm", ".dotx", ".dotm"} and self._has_meaningful_text(text_export):
                     logger.info(f"[{filename}] SUCCESS: Returning native DOCX text.")
                     return self._build_result(
                         raw_text=text_export,
@@ -169,14 +201,14 @@ class DocprocEngine:
                     )
 
             # 2. PPTX Path
-            elif ext in {".pptx", ".ppt", ".odp"}: 
+            elif ext in {".pptx", ".pptm", ".ppsx", ".ppsm", ".potx", ".potm", ".ppt", ".odp"}:
                 logger.info(f"[{filename}] Attempting PowerPoint/Slides text extraction...")
                 text_export = self._extract_pptx_text(file_content, limit)
                 should_render = self.config.render_pptx
                 logger.info(f"[{filename}] PowerPoint extraction complete. Chars: {len(text_export)}, should_render: {should_render}")
 
             # 3. Excel/Tabular Path (STRENGTHENED)
-            elif ext in {".xlsx", ".xls", ".xlsm", ".xlsb", ".csv", ".ods"}: 
+            elif ext in {".xlsx", ".xls", ".xlsm", ".xlsb", ".xltx", ".xltm", ".xla", ".xlam", ".csv", ".tsv", ".ods"}:
                 logger.info(f"[{filename}] Using complete spreadsheet extraction path.")
                 spreadsheet = self._extract_spreadsheet_complete(file_content, filename=filename)
                 if spreadsheet.get("normalized_text"):
@@ -186,6 +218,7 @@ class DocprocEngine:
                         quality_flags=spreadsheet["quality_flags"],
                         render_metadata=spreadsheet["render_metadata"],
                         structured_data=spreadsheet["structured_data"],
+                        transcription_status="partial" if "partial_extraction" in spreadsheet["quality_flags"] else "complete",
                     )
                 if not self.config.render_xlsx:
                     return self._build_result(
@@ -201,9 +234,9 @@ class DocprocEngine:
                 should_render = True
 
             # 4. Outlook MSG Path
-            elif ext == ".msg":
-                logger.info(f"[{filename}] Using native Outlook MSG extraction path.")
-                msg_result = self._extract_msg_complete(file_content, filename=filename)
+            elif ext in {".msg", ".eml"}:
+                logger.info(f"[{filename}] Using native email extraction path.")
+                msg_result = self._extract_msg_complete(file_content, filename=filename) if ext == ".msg" else self._extract_eml_complete(file_content, filename=filename)
                 if msg_result.get("normalized_text"):
                     return self._build_result(
                         raw_text=msg_result["raw_extracted_text"],
@@ -280,7 +313,7 @@ class DocprocEngine:
 
     def _extract_via_multimodal(self, *, file_content: bytes, filename: str, page_limit: int | None, hint: str | None = None, prompt: str | None = None) -> dict[str, Any]:
         ext = os.path.splitext(filename)[1].lower()
-        if ext in {".png", ".jpg", ".jpeg"}:
+        if ext in {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}:
             img_b64 = self._optimize_and_encode(file_content)
             text = self._clean_model_text(self._multimodal_transcribe_page(img_b64, filename=filename, page_number=1, hint=hint, prompt=prompt))
             if not self._has_meaningful_text(text):
@@ -430,7 +463,8 @@ class DocprocEngine:
         return base64.b64encode(output.getvalue()).decode("utf-8")
 
     def _render_office_to_pdf_and_extract(self, file_content: bytes, filename: str, page_limit: int | None, hint: str | None = None, prompt: str | None = None) -> dict[str, Any] | None:
-        if not shutil.which("soffice"): return None
+        if not shutil.which("soffice"):
+            return None
         ext = os.path.splitext(filename)[1].lower() or ".bin"
         with tempfile.TemporaryDirectory() as temp_dir:
             profile_dir = os.path.join(temp_dir, "profile")
@@ -438,16 +472,40 @@ class DocprocEngine:
             in_p = os.path.join(temp_dir, "in" + ext)
             with open(in_p, "wb") as f: f.write(file_content)
             try:
-                subprocess.run([
-                    "soffice", f"-env:UserInstallation=file://{profile_dir}",
-                    "--headless", "--convert-to", "pdf", "--outdir", temp_dir, in_p
-                ], check=True, timeout=self.config.office_render_timeout)
+                with self._office_semaphore:
+                    subprocess.run([
+                        "soffice", f"-env:UserInstallation=file://{profile_dir}",
+                        "--headless", "--convert-to", "pdf", "--outdir", temp_dir, in_p
+                    ], check=True, timeout=self.config.office_render_timeout)
                 pdf_p = os.path.join(temp_dir, "in.pdf")
                 if not os.path.exists(pdf_p):
                     pdf_p = os.path.join(temp_dir, os.path.splitext(os.path.basename(in_p))[0] + ".pdf")
-                with open(pdf_p, "rb") as f: 
-                    return self._extract_via_multimodal(file_content=f.read(), filename=filename, page_limit=page_limit, hint=hint, prompt=prompt)
-            except: return None
+                with open(pdf_p, "rb") as f:
+                    rendered_pdf = f.read()
+                native = self._extract_pdf_native(
+                    rendered_pdf,
+                    page_limit=page_limit,
+                    filename=f"{filename}.pdf",
+                )
+                if native:
+                    native.setdefault("render_metadata", {})["route"] = "office_to_pdf_native_text"
+                    return native
+                if self._uses_shared_text_endpoint_for_ocr():
+                    logger.warning(
+                        "[%s] Office rendering produced no native text and no dedicated OCR endpoint is configured",
+                        filename,
+                    )
+                    return None
+                return self._extract_via_multimodal(
+                    file_content=rendered_pdf,
+                    filename=f"{filename}.pdf",
+                    page_limit=page_limit,
+                    hint=hint,
+                    prompt=prompt,
+                )
+            except Exception as exc:
+                logger.warning("[%s] Office-to-PDF extraction failed: %s", filename, exc)
+                return None
 
     def _merge_extraction_results(self, rendered, text_export, route, fallback_flag):
         r_text = (rendered or {}).get("normalized_text", "").strip()
@@ -483,7 +541,9 @@ class DocprocEngine:
                     parts.append(f"--- DOCX TABLE {table_index} ---")
                     parts.extend(rows)
             return "\n".join(parts)
-        except: return ""
+        except Exception as exc:
+            logger.warning("DOCX native extraction failed: %s", exc)
+            return ""
 
     @staticmethod
     def _clean_model_text(text: str) -> str:
@@ -511,10 +571,30 @@ class DocprocEngine:
         try:
             prs = Presentation(io.BytesIO(file_content))
             return "\n".join([s.shapes[i].text for s in prs.slides for i in range(len(s.shapes)) if hasattr(s.shapes[i], "text")])
-        except: return ""
+        except Exception as exc:
+            logger.warning("PPTX native extraction failed: %s", exc)
+            return ""
 
-    def _extract_msg_complete(self, file_content: bytes, filename: str = "") -> dict[str, Any]:
+    def _extract_msg_complete(
+        self,
+        file_content: bytes,
+        filename: str = "",
+        *,
+        _depth: int = 0,
+        _state: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         digest = hashlib.sha256(file_content).hexdigest()
+        state = _state or {"seen": set(), "attachment_count": 0, "attachment_bytes": 0}
+        if digest in state["seen"]:
+            return self._build_result(
+                raw_text="",
+                normalized_text="",
+                quality_flags=["msg_duplicate_skipped"],
+                structured_data={"kind": "email_message", "filename": filename, "content_sha256": digest},
+                transcription_status="partial",
+                error="Duplicate or recursive MSG content was skipped.",
+            )
+        state["seen"].add(digest)
         try:
             import extract_msg
         except Exception as exc:
@@ -557,6 +637,7 @@ class DocprocEngine:
                 body_text = body or html_text
 
                 attachments = []
+                attachment_text_parts = []
                 for attachment in getattr(msg, "attachments", []) or []:
                     att_name = (
                         getattr(attachment, "longFilename", None)
@@ -568,10 +649,50 @@ class DocprocEngine:
                     data = getattr(attachment, "data", None)
                     if isinstance(data, (bytes, bytearray)):
                         att_size = len(data)
-                    attachments.append({
+                    attachment_info = {
                         "filename": self._clean_email_field(att_name),
                         "size_bytes": att_size,
-                    })
+                    }
+                    if isinstance(data, (bytes, bytearray)):
+                        child_bytes = bytes(data)
+                        child_digest = hashlib.sha256(child_bytes).hexdigest()
+                        attachment_info["content_sha256"] = child_digest
+                        child_ext = os.path.splitext(attachment_info["filename"])[1].lower()
+                        within_limits = (
+                            _depth < self.config.max_msg_depth
+                            and state["attachment_count"] < self.config.max_msg_attachments
+                            and state["attachment_bytes"] + len(child_bytes) <= self.config.max_msg_attachment_bytes
+                        )
+                        if child_ext in self.SUPPORTED_EXTENSIONS and within_limits and child_digest not in state["seen"]:
+                            state["attachment_count"] += 1
+                            state["attachment_bytes"] += len(child_bytes)
+                            if child_ext == ".msg":
+                                child = self._extract_msg_complete(
+                                    child_bytes,
+                                    attachment_info["filename"],
+                                    _depth=_depth + 1,
+                                    _state=state,
+                                )
+                            elif child_ext == ".eml":
+                                child = self._extract_eml_complete(child_bytes, attachment_info["filename"])
+                            else:
+                                child = self._extract_document_raw(
+                                    file_content=child_bytes,
+                                    filename=attachment_info["filename"],
+                                )
+                            attachment_info["extraction"] = {
+                                "transcription_status": child.get("transcription_status"),
+                                "quality_flags": child.get("quality_flags") or [],
+                                "structured_data": child.get("structured_data") or {},
+                            }
+                            child_text = str(child.get("normalized_text") or "").strip()
+                            if child_text:
+                                attachment_text_parts.append(
+                                    f"## Attachment: {attachment_info['filename']}\n{child_text}"
+                                )
+                        elif child_ext in self.SUPPORTED_EXTENSIONS:
+                            attachment_info["extraction_skipped"] = "recursion_or_size_limit"
+                    attachments.append(attachment_info)
 
                 parts = [f"# OUTLOOK MSG: {filename}", f"SHA256: {digest}", ""]
                 header_rows = [
@@ -597,6 +718,8 @@ class DocprocEngine:
                     parts.append("")
                     parts.append("## Body")
                     parts.append(body_text)
+                if attachment_text_parts:
+                    parts.extend(["", "## Extracted attachment contents", *attachment_text_parts])
 
                 normalized_text = "\n".join(parts).strip()
                 meaningful_payload = "\n".join(value for value in (subject, sender, to, cc, bcc, date, body_text) if value)
@@ -637,6 +760,8 @@ class DocprocEngine:
                         "attachment_count": len(attachments),
                         "body_chars": len(body_text or ""),
                         "html_body_used": bool(html_text and not body),
+                        "nested_attachments_extracted": state["attachment_count"],
+                        "nested_attachment_bytes": state["attachment_bytes"],
                     },
                     "structured_data": {
                         "kind": "email_message",
@@ -651,6 +776,7 @@ class DocprocEngine:
                         "date": date,
                         "message_id": message_id,
                         "attachments": attachments,
+                        "depth": _depth,
                     },
                 }
             except Exception as exc:
@@ -680,6 +806,73 @@ class DocprocEngine:
                             close()
                         except Exception:
                             pass
+
+    def _extract_eml_complete(self, file_content: bytes, filename: str = "") -> dict[str, Any]:
+        digest = hashlib.sha256(file_content).hexdigest()
+        try:
+            message = BytesParser(policy=policy.default).parsebytes(file_content)
+            bodies = []
+            attachments = []
+            for part in message.walk():
+                disposition = part.get_content_disposition()
+                part_name = part.get_filename()
+                if disposition == "attachment" or part_name:
+                    payload = part.get_payload(decode=True) or b""
+                    attachments.append({
+                        "filename": self._clean_email_field(part_name or "attachment"),
+                        "content_type": part.get_content_type(),
+                        "size_bytes": len(payload),
+                        "content_sha256": hashlib.sha256(payload).hexdigest() if payload else None,
+                    })
+                elif part.get_content_type() == "text/plain":
+                    bodies.append(str(part.get_content()))
+                elif not bodies and part.get_content_type() == "text/html":
+                    bodies.append(self._html_to_text(part.get_content()))
+            fields = {
+                "subject": self._clean_email_field(message.get("subject")),
+                "sender": self._clean_email_field(message.get("from")),
+                "to": self._clean_email_field(message.get("to")),
+                "cc": self._clean_email_field(message.get("cc")),
+                "bcc": self._clean_email_field(message.get("bcc")),
+                "date": self._clean_email_field(message.get("date")),
+                "message_id": self._clean_email_field(message.get("message-id")),
+            }
+            body = "\n\n".join(item.strip() for item in bodies if item.strip())
+            rows = [f"# EMAIL: {filename}"]
+            rows.extend(f"{key.replace('_', ' ').title()}: {value}" for key, value in fields.items() if value)
+            if body:
+                rows.extend(["", "## Body", body])
+            if attachments:
+                rows.extend(["", "## Attachments", *[f"- {item['filename']} ({item['size_bytes']} bytes)" for item in attachments]])
+            text = "\n".join(rows).strip()
+            return self._build_result(
+                raw_text=text,
+                normalized_text=text,
+                quality_flags=["eml_native", "direct_text", "email_headers_extracted"],
+                render_metadata={"route": "eml_native", "content_sha256": digest, "attachment_count": len(attachments)},
+                structured_data={"kind": "email_message", "format": "eml", "filename": filename, "content_sha256": digest, **fields, "attachments": attachments},
+            )
+        except Exception as exc:
+            return self._build_result(
+                raw_text="",
+                normalized_text="",
+                quality_flags=["eml_native_failed"],
+                render_metadata={"route": "eml_native", "content_sha256": digest},
+                structured_data={"kind": "email_message", "format": "eml", "filename": filename, "content_sha256": digest},
+                transcription_status="failed",
+                error=str(exc),
+            )
+
+    @staticmethod
+    def _decode_text(file_content: bytes) -> str:
+        try:
+            from charset_normalizer import from_bytes
+            best = from_bytes(file_content).best()
+            if best is not None:
+                return str(best)
+        except Exception:
+            pass
+        return file_content.decode("utf-8-sig", errors="replace")
 
     @staticmethod
     def _clean_email_field(value: Any) -> str:
@@ -711,14 +904,14 @@ class DocprocEngine:
     def _extract_spreadsheet_complete(self, file_content: bytes, filename: str = "") -> dict[str, Any]:
         ext = os.path.splitext(filename)[1].lower()
         try:
-            if ext == ".csv":
+            if ext in {".csv", ".tsv"}:
                 return self._extract_csv_complete(file_content, filename=filename)
-            if ext in {".xlsx", ".xlsm"}:
+            if ext in {".xlsx", ".xlsm", ".xltx", ".xltm"}:
                 return self._extract_openpyxl_complete(file_content, filename=filename)
-            return self._extract_pandas_spreadsheet_complete(file_content, filename=filename)
+            return self._extract_calamine_spreadsheet_complete(file_content, filename=filename)
         except Exception as exc:
             logger.warning(f"[{filename}] Structured spreadsheet reader failed: {exc}")
-            if ext in {".xls", ".ods"}:
+            if ext in {".xls", ".xlsb", ".xla", ".xlam", ".ods"}:
                 recovered = self._extract_legacy_spreadsheet_via_libreoffice(file_content, filename=filename, original_error=exc)
                 if recovered:
                     return recovered
@@ -744,14 +937,15 @@ class DocprocEngine:
             }
 
     def _extract_csv_complete(self, file_content: bytes, filename: str = "") -> dict[str, Any]:
-        decoded = file_content.decode("utf-8-sig", errors="replace")
-        rows = list(csv.reader(io.StringIO(decoded)))
+        decoded = self._decode_text(file_content)
+        delimiter = "\t" if os.path.splitext(filename)[1].lower() == ".tsv" else ","
+        rows = list(csv.reader(io.StringIO(decoded), delimiter=delimiter))
         chunk_rows = max(1, self.config.spreadsheet_chunk_rows)
         chunks = []
         text_parts = [f"# CSV: {filename}", ""]
         for start in range(0, len(rows), chunk_rows):
             end = min(start + chunk_rows, len(rows))
-            lines = [",".join(row) for row in rows[start:end]]
+            lines = ["\t".join(row) for row in rows[start:end]]
             chunk_text = "\n".join(lines)
             chunks.append({
                 "text": chunk_text,
@@ -770,7 +964,7 @@ class DocprocEngine:
         digest = hashlib.sha256(file_content).hexdigest()
         structured_data = {
             "kind": "spreadsheet",
-            "format": "csv",
+            "format": os.path.splitext(filename)[1].lower().lstrip(".") or "csv",
             "filename": filename,
             "content_sha256": digest,
             "sheets": [{"name": "CSV", "row_count": len(rows), "column_count": max((len(row) for row in rows), default=0)}],
@@ -793,15 +987,31 @@ class DocprocEngine:
     def _extract_openpyxl_complete(self, file_content: bytes, filename: str = "") -> dict[str, Any]:
         ext = os.path.splitext(filename)[1].lower()
         digest = hashlib.sha256(file_content).hexdigest()
-        formula_wb = load_workbook(io.BytesIO(file_content), data_only=False, read_only=True)
-        value_wb = load_workbook(io.BytesIO(file_content), data_only=True, read_only=True)
+        keep_vba = ext in {".xlsm", ".xltm"}
+        formula_wb = load_workbook(io.BytesIO(file_content), data_only=False, read_only=False, keep_vba=keep_vba)
+        value_wb = load_workbook(io.BytesIO(file_content), data_only=True, read_only=True, keep_vba=keep_vba)
         chunk_rows = max(1, self.config.spreadsheet_chunk_rows)
         text_parts = [f"# WORKBOOK: {filename}", f"SHA256: {digest}", ""]
         sheets = []
         chunks = []
         flags = ["spreadsheet_structured", "raw_complete", "artifact_backed"]
+        nonempty_cells = 0
+        truncated = False
 
-        for sheet_name in formula_wb.sheetnames:
+        macro_metadata = {"present": False}
+        if keep_vba:
+            with zipfile.ZipFile(io.BytesIO(file_content)) as archive:
+                macro_names = [name for name in archive.namelist() if name.lower().endswith("vbaproject.bin")]
+                if macro_names:
+                    payload = archive.read(macro_names[0])
+                    macro_metadata = {
+                        "present": True,
+                        "size_bytes": len(payload),
+                        "sha256": hashlib.sha256(payload).hexdigest(),
+                    }
+                    flags.append("macros_present_metadata_only")
+
+        for sheet_name in formula_wb.sheetnames[: self.config.max_sheets]:
             ws_formula = formula_wb[sheet_name]
             ws_value = value_wb[sheet_name]
             max_row = ws_formula.max_row or 0
@@ -810,7 +1020,7 @@ class DocprocEngine:
             hidden = ws_formula.sheet_state != "visible"
             merged_cells = getattr(ws_formula, "merged_cells", None)
             merged_ranges = [str(rng) for rng in getattr(merged_cells, "ranges", [])]
-            sheet_info = {
+            sheet_info: dict[str, Any] = {
                 "name": sheet_name,
                 "row_count": max_row,
                 "column_count": max_col,
@@ -818,6 +1028,15 @@ class DocprocEngine:
                 "column_end": column_end,
                 "hidden": hidden,
                 "merged_ranges": merged_ranges,
+                "freeze_panes": str(ws_formula.freeze_panes or ""),
+                "auto_filter": str(ws_formula.auto_filter.ref or ""),
+                "tables": [
+                    {"name": table.name, "range": str(table.ref), "display_name": table.displayName}
+                    for table in ws_formula.tables.values()
+                ],
+                "data_validation_count": len(getattr(ws_formula.data_validations, "dataValidation", []) or []),
+                "conditional_formatting_count": len(ws_formula.conditional_formatting),
+                "cells": [],
             }
             sheets.append(sheet_info)
             if hidden and "hidden_sheets_present" not in flags:
@@ -832,10 +1051,12 @@ class DocprocEngine:
 
             chunk_buffer = []
             chunk_start = 1
-            for row_index, (formula_row, value_row) in enumerate(
-                zip(ws_formula.iter_rows(values_only=False), ws_value.iter_rows(values_only=True)),
+            value_rows = ws_value.iter_rows(values_only=True)
+            for row_index, formula_row in enumerate(
+                ws_formula.iter_rows(values_only=False),
                 start=1,
             ):
+                value_row = next(value_rows, ())
                 values = []
                 for col_index in range(1, max_col + 1):
                     formula_cell = formula_row[col_index - 1] if col_index <= len(formula_row) else None
@@ -843,8 +1064,27 @@ class DocprocEngine:
                     raw_value = formula_cell.value if formula_cell is not None else None
                     formatted = self._format_cell_value(raw_value, cached_value)
                     values.append(formatted)
+                    hyperlink = getattr(formula_cell, "hyperlink", None) if formula_cell is not None else None
+                    comment = getattr(formula_cell, "comment", None) if formula_cell is not None else None
+                    if raw_value is not None or cached_value is not None or hyperlink is not None or comment is not None:
+                        nonempty_cells += 1
+                        if nonempty_cells > self.config.max_nonempty_cells:
+                            truncated = True
+                            break
+                        sheet_info["cells"].append({
+                            "coordinate": formula_cell.coordinate,
+                            "value": raw_value,
+                            "cached_value": cached_value,
+                            "data_type": formula_cell.data_type,
+                            "number_format": formula_cell.number_format,
+                            "style_id": formula_cell.style_id,
+                            "hyperlink": getattr(hyperlink, "target", None),
+                            "comment": getattr(comment, "text", None),
+                        })
                     if isinstance(raw_value, str) and raw_value.startswith("=") and "formulas_present" not in flags:
                         flags.append("formulas_present")
+                if truncated:
+                    break
                 row_text = f"{row_index}\t" + "\t".join(values)
                 text_parts.append(row_text)
                 chunk_buffer.append(row_text)
@@ -877,18 +1117,45 @@ class DocprocEngine:
                     },
                 })
             text_parts.append("")
+            if truncated:
+                break
 
+        sheet_order = list(formula_wb.sheetnames)
+        workbook_metadata = {
+            "sheet_order": sheet_order,
+            "defined_names": [str(item) for item in formula_wb.defined_names.values()],
+            "calculation": str(getattr(formula_wb, "calculation", "")),
+            "properties": {
+                "title": formula_wb.properties.title,
+                "subject": formula_wb.properties.subject,
+                "creator": formula_wb.properties.creator,
+                "company": getattr(formula_wb.properties, "company", None),
+            },
+            "macros": macro_metadata,
+        }
         formula_wb.close()
         value_wb.close()
+        if len(sheet_order) > self.config.max_sheets or truncated:
+            flags = [flag for flag in flags if flag != "raw_complete"]
+            flags.extend(["partial_extraction", "spreadsheet_manifest_limit_reached"])
         structured_data = {
+            "schema_version": "2",
             "kind": "spreadsheet",
             "format": ext.lstrip("."),
             "filename": filename,
             "content_sha256": digest,
             "sheets": sheets,
             "chunks": chunks,
+            "workbook": workbook_metadata,
+            "nonempty_cell_count": min(nonempty_cells, self.config.max_nonempty_cells),
+            "truncated": truncated,
         }
         normalized_text = "\n".join(text_parts).strip()
+        if len(normalized_text) > self.config.max_extracted_chars:
+            normalized_text = normalized_text[: self.config.max_extracted_chars]
+            structured_data["truncated"] = True
+            flags = [flag for flag in flags if flag != "raw_complete"]
+            flags.extend(["partial_extraction", "spreadsheet_text_limit_reached"])
         return {
             "raw_extracted_text": normalized_text,
             "normalized_text": normalized_text,
@@ -897,28 +1164,33 @@ class DocprocEngine:
                 "route": "spreadsheet_structured",
                 "content_sha256": digest,
                 "sheet_count": len(sheets),
-                "sheets": sheets,
+                "sheet_names": [sheet["name"] for sheet in sheets],
                 "spreadsheet_chunk_count": len(chunks),
                 "rendered_sheet_count": 0,
+                "nonempty_cell_count": structured_data["nonempty_cell_count"],
+                "manifest_truncated": structured_data["truncated"],
             },
             "structured_data": structured_data,
         }
 
-    def _extract_pandas_spreadsheet_complete(self, file_content: bytes, filename: str = "") -> dict[str, Any]:
-        import pandas as pd
+    def _extract_calamine_spreadsheet_complete(self, file_content: bytes, filename: str = "") -> dict[str, Any]:
+        from python_calamine import CalamineWorkbook
+
         ext = os.path.splitext(filename)[1].lower()
-        engine = "pyxlsb" if ext == ".xlsb" else "xlrd" if ext == ".xls" else None
         digest = hashlib.sha256(file_content).hexdigest()
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            sheets_map = pd.read_excel(io.BytesIO(file_content), sheet_name=None, engine=engine, header=None, dtype=object)
+        workbook = CalamineWorkbook.from_filelike(io.BytesIO(file_content))
         chunk_rows = max(1, self.config.spreadsheet_chunk_rows)
         text_parts = [f"# WORKBOOK: {filename}", f"SHA256: {digest}", ""]
         sheets = []
         chunks = []
-        for sheet_name, df in sheets_map.items():
-            row_count = int(df.shape[0])
-            column_count = int(df.shape[1])
+        nonempty_cells = 0
+        truncated = False
+        for sheet_name in workbook.sheet_names[: self.config.max_sheets]:
+            rows = workbook.get_sheet_by_name(sheet_name).to_python(skip_empty_area=False)
+            row_count = len(rows)
+            column_count = max((len(row) for row in rows), default=0)
             column_end = get_column_letter(column_count) if column_count else "A"
+            sheet_cells = []
             sheets.append({
                 "name": sheet_name,
                 "row_count": row_count,
@@ -927,16 +1199,27 @@ class DocprocEngine:
                 "column_end": column_end,
                 "hidden": None,
                 "merged_ranges": [],
+                "cells": sheet_cells,
             })
             text_parts.append(f"## SHEET: {sheet_name}")
             text_parts.append(f"ROWS: {row_count} COLUMNS: {column_count}")
-            rows = []
-            for idx, row in df.iterrows():
-                values = ["" if pd.isna(value) else str(value) for value in row.tolist()]
-                rows.append(f"{idx + 1}\t" + "\t".join(values))
-            for start in range(0, len(rows), chunk_rows):
-                end = min(start + chunk_rows, len(rows))
-                chunk_text = "\n".join(rows[start:end])
+            rendered_rows = []
+            for row_index, row in enumerate(rows, start=1):
+                values = []
+                for col_index, value in enumerate(row, start=1):
+                    values.append("" if value is None else str(value))
+                    if value is not None:
+                        nonempty_cells += 1
+                        if nonempty_cells > self.config.max_nonempty_cells:
+                            truncated = True
+                            break
+                        sheet_cells.append({"coordinate": f"{get_column_letter(col_index)}{row_index}", "value": value})
+                rendered_rows.append(f"{row_index}\t" + "\t".join(values))
+                if truncated:
+                    break
+            for start in range(0, len(rendered_rows), chunk_rows):
+                end = min(start + chunk_rows, len(rendered_rows))
+                chunk_text = "\n".join(rendered_rows[start:end])
                 chunks.append({
                     "text": chunk_text,
                     "metadata": {
@@ -950,19 +1233,29 @@ class DocprocEngine:
                 })
                 text_parts.append(chunk_text)
             text_parts.append("")
+            if truncated:
+                break
         structured_data = {
+            "schema_version": "2",
             "kind": "spreadsheet",
             "format": ext.lstrip("."),
             "filename": filename,
             "content_sha256": digest,
             "sheets": sheets,
             "chunks": chunks,
+            "nonempty_cell_count": min(nonempty_cells, self.config.max_nonempty_cells),
+            "truncated": truncated,
         }
         normalized_text = "\n".join(text_parts).strip()
+        flags = ["spreadsheet_structured", "artifact_backed", "calamine"]
+        if truncated or len(workbook.sheet_names) > self.config.max_sheets:
+            flags.extend(["partial_extraction", "spreadsheet_manifest_limit_reached"])
+        else:
+            flags.append("raw_complete")
         return {
             "raw_extracted_text": normalized_text,
             "normalized_text": normalized_text,
-            "quality_flags": ["spreadsheet_structured", "raw_complete", "artifact_backed"],
+            "quality_flags": flags,
             "render_metadata": {
                 "route": "spreadsheet_structured",
                 "content_sha256": digest,
@@ -970,6 +1263,9 @@ class DocprocEngine:
                 "sheets": sheets,
                 "spreadsheet_chunk_count": len(chunks),
                 "rendered_sheet_count": 0,
+                "reader": "python-calamine",
+                "nonempty_cell_count": structured_data["nonempty_cell_count"],
+                "manifest_truncated": truncated,
             },
             "structured_data": structured_data,
         }
@@ -1032,88 +1328,6 @@ class DocprocEngine:
                 return f"{raw_value} => {cached_value}"
             return raw_value
         return str(raw_value if raw_value is not None else cached_value)
-
-    @staticmethod
-    def _extract_xlsx_text(file_content: bytes, page_limit: int | None, filename: str = "") -> tuple[str, list[str]]:
-        """
-        High-fidelity Excel/CSV extraction.
-        Converts sheets to Markdown tables for optimal LLM consumption.
-        """
-        ext = os.path.splitext(filename)[1].lower() if filename else ""
-        try:
-            import pandas as pd
-            excel_file = io.BytesIO(file_content)
-            
-            # Special Case: CSV
-            if ext == ".csv":
-                logger.info(f"Attempting pandas CSV extraction...")
-                df = pd.read_csv(excel_file)
-                if df.empty: return "", []
-                df = df.dropna(how='all').dropna(axis=1, how='all')
-                text_out = df.to_markdown(index=False)
-                return text_out, ["CSV_Sheet"]
-
-            # Standard Excel Path
-            logger.info(f"Attempting pandas extraction for Excel ({ext})...")
-            # engine='openpyxl' supports xlsx, xlsm, xltx, xltm. 
-            # engine='pyxlsb' for xlsb. 
-            # engine='xlrd' for old xls.
-            
-            engine = 'openpyxl'
-            if ext == ".xlsb": engine = 'pyxlsb'
-            elif ext == ".xls": engine = 'xlrd'
-
-            all_sheets = pd.read_excel(excel_file, sheet_name=None, engine=engine)
-            
-            res = []
-            sheet_names = []
-            
-            for name, df in all_sheets.items():
-                sheet_names.append(name)
-                if df.empty:
-                    continue
-                
-                # Clean up: remove entirely empty rows/columns to save tokens
-                df = df.dropna(how='all').dropna(axis=1, how='all')
-                if df.empty:
-                    continue
-
-                res.append(f"### SHEET: {name}")
-                # Convert to high-contrast Markdown table
-                try:
-                    res.append(df.to_markdown(index=False))
-                except Exception as table_err:
-                    logger.warning(f"Markdown table conversion failed for sheet {name}, using TSV: {table_err}")
-                    res.append(df.to_csv(sep='\t', index=False))
-                res.append("\n")
-
-            text_out = "\n\n".join(res)
-            logger.info(f"Pandas extraction complete. Extracted {len(text_out)} characters from {len(sheet_names)} sheets.")
-            return text_out, sheet_names
-        except Exception as e:
-            logger.error(f"Advanced pandas Excel extraction failed: {e}")
-            try:
-                # Basic fallback if pandas fails (openpyxl only supports modern XML formats)
-                logger.info("Attempting openpyxl read_only fallback...")
-                from openpyxl import load_workbook
-                wb = load_workbook(io.BytesIO(file_content), data_only=True, read_only=True)
-                res = []
-                for name in wb.sheetnames:
-                    rows = []
-                    # Limit rows in fallback to prevent massive strings
-                    for row_idx, r in enumerate(wb[name].iter_rows(values_only=True)):
-                        rows.append("\t".join([str(c) if c else "" for c in r]))
-                        if row_idx > 5000: # Safety cap
-                            rows.append("... [TRUNCATED DUE TO SIZE] ...")
-                            break
-                    res.append(f"--- {name} ---\n" + "\n".join(rows))
-                
-                text_out = "\n".join(res)
-                logger.info(f"Openpyxl fallback complete. Extracted {len(text_out)} characters.")
-                return text_out, wb.sheetnames
-            except Exception as e2:
-                logger.error(f"Openpyxl fallback also failed: {e2}")
-                return "", []
 
     @staticmethod
     def _build_result(*, raw_text: str, normalized_text: str, quality_flags: list[str], render_metadata: dict = None, structured_data: dict = None, transcription_status="complete", error=None) -> dict:
