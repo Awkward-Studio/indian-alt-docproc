@@ -464,7 +464,13 @@ class DocprocEngine:
 
     def _render_office_to_pdf_and_extract(self, file_content: bytes, filename: str, page_limit: int | None, hint: str | None = None, prompt: str | None = None) -> dict[str, Any] | None:
         if not shutil.which("soffice"):
-            return None
+            return self._build_result(
+                raw_text="",
+                normalized_text="",
+                quality_flags=["office_conversion_unavailable"],
+                transcription_status="failed",
+                error="LibreOffice is not installed on the document processor.",
+            )
         ext = os.path.splitext(filename)[1].lower() or ".bin"
         with tempfile.TemporaryDirectory() as temp_dir:
             profile_dir = os.path.join(temp_dir, "profile")
@@ -495,7 +501,13 @@ class DocprocEngine:
                         "[%s] Office rendering produced no native text and no dedicated OCR endpoint is configured",
                         filename,
                     )
-                    return None
+                    return self._build_result(
+                        raw_text="",
+                        normalized_text="",
+                        quality_flags=["office_rendered_image_only", "dedicated_ocr_required"],
+                        transcription_status="failed",
+                        error="Office conversion produced no readable native text and OCR is unavailable.",
+                    )
                 return self._extract_via_multimodal(
                     file_content=rendered_pdf,
                     filename=f"{filename}.pdf",
@@ -505,7 +517,13 @@ class DocprocEngine:
                 )
             except Exception as exc:
                 logger.warning("[%s] Office-to-PDF extraction failed: %s", filename, exc)
-                return None
+                return self._build_result(
+                    raw_text="",
+                    normalized_text="",
+                    quality_flags=["office_conversion_failed"],
+                    transcription_status="failed",
+                    error=f"LibreOffice could not convert this file: {exc}",
+                )
 
     def _merge_extraction_results(self, rendered, text_export, route, fallback_flag):
         r_text = (rendered or {}).get("normalized_text", "").strip()
@@ -515,7 +533,14 @@ class DocprocEngine:
             return self._build_result(raw_text=merged, normalized_text=merged, quality_flags=["merged"], render_metadata={"route": route})
         if r_text: return rendered
         if t_text: return self._build_result(raw_text=t_text, normalized_text=t_text, quality_flags=[fallback_flag])
-        return self._build_result(raw_text="", normalized_text="", quality_flags=[fallback_flag, "failed"], transcription_status="failed")
+        rendered_flags = (rendered or {}).get("quality_flags") or []
+        return self._build_result(
+            raw_text="",
+            normalized_text="",
+            quality_flags=[fallback_flag, *rendered_flags, "failed"],
+            transcription_status="failed",
+            error=(rendered or {}).get("error") or "Office extraction produced no readable content.",
+        )
 
     @staticmethod
     def _extract_docx_text(file_content: bytes, page_limit: int | None) -> str:

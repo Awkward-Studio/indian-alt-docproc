@@ -169,8 +169,18 @@ class DocprocEngineModelTests(unittest.TestCase):
 
         result = engine._render_office_to_pdf_and_extract(b"office", "memo.docx", None)
 
-        self.assertIsNone(result)
+        self.assertEqual(result["transcription_status"], "failed")
+        self.assertIn("OCR is unavailable", result["error"])
         engine._extract_via_multimodal.assert_not_called()
+
+    @patch("engine.shutil.which", return_value="/usr/bin/soffice")
+    @patch("engine.subprocess.run", side_effect=RuntimeError("conversion rejected"))
+    def test_office_conversion_failure_is_returned_to_the_caller(self, run, which):
+        result = self.engine._render_office_to_pdf_and_extract(b"broken", "legacy.doc", None)
+
+        self.assertEqual(result["transcription_status"], "failed")
+        self.assertIn("LibreOffice could not convert", result["error"])
+        self.assertIn("office_conversion_failed", result["quality_flags"])
 
     def test_xlsx_manifest_preserves_formula_zero_comment_and_hyperlink(self):
         workbook = Workbook()
