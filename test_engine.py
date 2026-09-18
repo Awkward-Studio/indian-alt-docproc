@@ -207,6 +207,42 @@ class DocprocEngineModelTests(unittest.TestCase):
         self.assertIn("formulas_present", result["quality_flags"])
         self.assertNotIn("sheets", result["render_metadata"])
 
+    def test_xlsx_normalized_text_omits_blank_cells_and_rows_but_names_empty_sheets(self):
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "Operating Model"
+        sheet["A1"] = 0
+        sheet["B1"] = "   "
+        sheet["C3"] = "  Revenue   growth\n FY26  "
+        # A styled cell can inflate Excel's used range without containing data.
+        sheet["Z1000"].number_format = "0.00"
+        empty = workbook.create_sheet("Empty Assumptions")
+        empty["Z1000"].number_format = "0.00"
+        payload = io.BytesIO()
+        workbook.save(payload)
+
+        result = self.engine._extract_openpyxl_complete(payload.getvalue(), "sparse.xlsx")
+        normalized = result["normalized_text"]
+        operating, empty_sheet = result["structured_data"]["sheets"]
+
+        self.assertIn("## SHEET: Operating Model", normalized)
+        self.assertIn("A1=0", normalized)
+        self.assertIn("C3=Revenue growth ⏎ FY26", normalized)
+        self.assertNotIn("B1=", normalized)
+        self.assertNotIn("Z1000=", normalized)
+        self.assertNotIn("1000\t", normalized)
+        self.assertIn("## SHEET: Empty Assumptions", normalized)
+        self.assertIn("EMPTY: no populated cells", normalized)
+        self.assertEqual(operating["row_count"], 3)
+        self.assertEqual(operating["physical_row_count"], 1000)
+        self.assertEqual(operating["populated_row_count"], 2)
+        self.assertEqual(empty_sheet["row_count"], 0)
+        self.assertEqual(empty_sheet["physical_row_count"], 1000)
+        self.assertFalse(any(
+            chunk["metadata"]["sheet_name"] == "Empty Assumptions"
+            for chunk in result["structured_data"]["chunks"]
+        ))
+
     def test_calamine_reader_emits_semantic_sheet_chunks(self):
         workbook = Workbook()
         sheet = workbook.active
@@ -224,6 +260,7 @@ class DocprocEngineModelTests(unittest.TestCase):
         self.assertEqual(result["structured_data"]["kind"], "spreadsheet")
         self.assertEqual(result["structured_data"]["sheets"][0]["name"], "Operating Case")
         self.assertIn("Revenue", result["structured_data"]["chunks"][0]["text"])
+        self.assertNotIn("sheets", result["render_metadata"])
 
 
 if __name__ == "__main__":

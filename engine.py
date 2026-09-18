@@ -968,32 +968,64 @@ class DocprocEngine:
         chunk_rows = max(1, self.config.spreadsheet_chunk_rows)
         chunks = []
         text_parts = [f"# CSV: {filename}", ""]
-        for start in range(0, len(rows), chunk_rows):
-            end = min(start + chunk_rows, len(rows))
-            lines = ["\t".join(row) for row in rows[start:end]]
-            chunk_text = "\n".join(lines)
+        populated_rows = []
+        cells = []
+        for row_number, row in enumerate(rows, start=1):
+            rendered_cells = []
+            for column_number, value in enumerate(row, start=1):
+                if not self._spreadsheet_value_present(value):
+                    continue
+                coordinate = f"{get_column_letter(column_number)}{row_number}"
+                cells.append({"coordinate": coordinate, "value": value})
+                rendered_cells.append(
+                    f"{coordinate}={self._normalize_spreadsheet_text_value(value)}"
+                )
+            if rendered_cells:
+                populated_rows.append((row_number, " | ".join(rendered_cells)))
+
+        for start in range(0, len(populated_rows), chunk_rows):
+            batch = populated_rows[start:start + chunk_rows]
+            chunk_text = "\n".join(line for _, line in batch)
             chunks.append({
                 "text": chunk_text,
                 "metadata": {
-                    "chunk_kind": "spreadsheet_range",
+                    "chunk_kind": "spreadsheet_cells",
                     "sheet_name": "CSV",
-                    "row_start": start + 1,
-                    "row_end": end,
+                    "row_start": batch[0][0],
+                    "row_end": batch[-1][0],
                     "column_start": "A",
-                    "column_end": get_column_letter(max((len(row) for row in rows[start:end]), default=1)),
+                    "column_end": get_column_letter(max((len(row) for row in rows), default=1)),
                 },
             })
-            text_parts.append(f"## SHEET: CSV rows {start + 1}-{end}")
+            text_parts.append(
+                f"## SHEET: CSV rows {batch[0][0]}-{batch[-1][0]}"
+            )
             text_parts.append(chunk_text)
             text_parts.append("")
+        if not populated_rows:
+            text_parts.extend(["## SHEET: CSV", "EMPTY: no populated cells"])
         digest = hashlib.sha256(file_content).hexdigest()
+        last_populated_row = populated_rows[-1][0] if populated_rows else 0
+        # CSV columns are positional. Keep the physical width as metadata while
+        # the normalized payload contains only populated, coordinate-labelled cells.
+        physical_column_count = max((len(row) for row in rows), default=0)
         structured_data = {
+            "schema_version": "2",
             "kind": "spreadsheet",
             "format": os.path.splitext(filename)[1].lower().lstrip(".") or "csv",
             "filename": filename,
             "content_sha256": digest,
-            "sheets": [{"name": "CSV", "row_count": len(rows), "column_count": max((len(row) for row in rows), default=0)}],
+            "sheets": [{
+                "name": "CSV",
+                "row_count": last_populated_row,
+                "column_count": physical_column_count if cells else 0,
+                "physical_row_count": len(rows),
+                "physical_column_count": physical_column_count,
+                "populated_row_count": len(populated_rows),
+                "cells": cells,
+            }],
             "chunks": chunks,
+            "nonempty_cell_count": len(cells),
         }
         return {
             "raw_extracted_text": "\n".join(text_parts).strip(),
@@ -1003,7 +1035,10 @@ class DocprocEngine:
                 "route": "spreadsheet_structured",
                 "content_sha256": digest,
                 "sheet_count": 1,
-                "row_count": len(rows),
+                "row_count": last_populated_row,
+                "physical_row_count": len(rows),
+                "populated_row_count": len(populated_rows),
+                "nonempty_cell_count": len(cells),
                 "rendered_sheet_count": 0,
             },
             "structured_data": structured_data,
@@ -1039,18 +1074,20 @@ class DocprocEngine:
         for sheet_name in formula_wb.sheetnames[: self.config.max_sheets]:
             ws_formula = formula_wb[sheet_name]
             ws_value = value_wb[sheet_name]
-            max_row = ws_formula.max_row or 0
-            max_col = ws_formula.max_column or 0
-            column_end = get_column_letter(max_col) if max_col else "A"
+            physical_max_row = ws_formula.max_row or 0
+            physical_max_col = ws_formula.max_column or 0
             hidden = ws_formula.sheet_state != "visible"
             merged_cells = getattr(ws_formula, "merged_cells", None)
             merged_ranges = [str(rng) for rng in getattr(merged_cells, "ranges", [])]
             sheet_info: dict[str, Any] = {
                 "name": sheet_name,
-                "row_count": max_row,
-                "column_count": max_col,
+                "row_count": 0,
+                "column_count": 0,
+                "physical_row_count": physical_max_row,
+                "physical_column_count": physical_max_col,
+                "populated_row_count": 0,
                 "column_start": "A",
-                "column_end": column_end,
+                "column_end": "A",
                 "hidden": hidden,
                 "merged_ranges": merged_ranges,
                 "freeze_panes": str(ws_formula.freeze_panes or ""),
@@ -1070,34 +1107,37 @@ class DocprocEngine:
                 flags.append("merged_cells_present")
 
             text_parts.append(f"## SHEET: {sheet_name}")
-            text_parts.append(f"ROWS: {max_row} COLUMNS: {max_col} HIDDEN: {hidden}")
             if merged_ranges:
                 text_parts.append("MERGED_RANGES: " + ", ".join(merged_ranges))
 
-            chunk_buffer = []
-            chunk_start = 1
+            populated_rows: list[tuple[int, int, int, str]] = []
             value_rows = ws_value.iter_rows(values_only=True)
             for row_index, formula_row in enumerate(
                 ws_formula.iter_rows(values_only=False),
                 start=1,
             ):
                 value_row = next(value_rows, ())
-                values = []
-                for col_index in range(1, max_col + 1):
+                rendered_cells = []
+                row_columns = []
+                for col_index in range(1, physical_max_col + 1):
                     formula_cell = formula_row[col_index - 1] if col_index <= len(formula_row) else None
                     cached_value = value_row[col_index - 1] if col_index <= len(value_row) else None
                     raw_value = formula_cell.value if formula_cell is not None else None
-                    formatted = self._format_cell_value(raw_value, cached_value)
-                    values.append(formatted)
                     hyperlink = getattr(formula_cell, "hyperlink", None) if formula_cell is not None else None
                     comment = getattr(formula_cell, "comment", None) if formula_cell is not None else None
-                    if raw_value is not None or cached_value is not None or hyperlink is not None or comment is not None:
+                    if (
+                        self._spreadsheet_value_present(raw_value)
+                        or self._spreadsheet_value_present(cached_value)
+                        or hyperlink is not None
+                        or comment is not None
+                    ):
                         nonempty_cells += 1
                         if nonempty_cells > self.config.max_nonempty_cells:
                             truncated = True
                             break
+                        coordinate = formula_cell.coordinate
                         sheet_info["cells"].append({
-                            "coordinate": formula_cell.coordinate,
+                            "coordinate": coordinate,
                             "value": raw_value,
                             "cached_value": cached_value,
                             "data_type": formula_cell.data_type,
@@ -1106,41 +1146,54 @@ class DocprocEngine:
                             "hyperlink": getattr(hyperlink, "target", None),
                             "comment": getattr(comment, "text", None),
                         })
+                        rendered = self._render_spreadsheet_cell(
+                            coordinate=coordinate,
+                            raw_value=raw_value,
+                            cached_value=cached_value,
+                            hyperlink=getattr(hyperlink, "target", None),
+                            comment=getattr(comment, "text", None),
+                        )
+                        rendered_cells.append(rendered)
+                        row_columns.append(col_index)
                     if isinstance(raw_value, str) and raw_value.startswith("=") and "formulas_present" not in flags:
                         flags.append("formulas_present")
                 if truncated:
                     break
-                row_text = f"{row_index}\t" + "\t".join(values)
-                text_parts.append(row_text)
-                chunk_buffer.append(row_text)
+                if rendered_cells:
+                    populated_rows.append((
+                        row_index,
+                        min(row_columns),
+                        max(row_columns),
+                        " | ".join(rendered_cells),
+                    ))
 
-                if len(chunk_buffer) >= chunk_rows:
+            if populated_rows:
+                sheet_info["row_count"] = populated_rows[-1][0]
+                sheet_info["column_count"] = max(row[2] for row in populated_rows)
+                sheet_info["column_end"] = get_column_letter(sheet_info["column_count"])
+                sheet_info["populated_row_count"] = len(populated_rows)
+                text_parts.append(
+                    f"POPULATED ROWS: {len(populated_rows)} "
+                    f"RANGE: A1:{sheet_info['column_end']}{sheet_info['row_count']} "
+                    f"HIDDEN: {hidden}"
+                )
+                for start in range(0, len(populated_rows), chunk_rows):
+                    batch = populated_rows[start:start + chunk_rows]
+                    chunk_text = "\n".join(row[3] for row in batch)
+                    text_parts.append(chunk_text)
                     chunks.append({
-                        "text": "\n".join(chunk_buffer),
+                        "text": chunk_text,
                         "metadata": {
-                            "chunk_kind": "spreadsheet_range",
+                            "chunk_kind": "spreadsheet_cells",
                             "sheet_name": sheet_name,
-                            "row_start": chunk_start,
-                            "row_end": row_index,
-                            "column_start": "A",
-                            "column_end": column_end,
+                            "row_start": batch[0][0],
+                            "row_end": batch[-1][0],
+                            "column_start": get_column_letter(min(row[1] for row in batch)),
+                            "column_end": get_column_letter(max(row[2] for row in batch)),
                         },
                     })
-                    chunk_buffer = []
-                    chunk_start = row_index + 1
-
-            if chunk_buffer:
-                chunks.append({
-                    "text": "\n".join(chunk_buffer),
-                    "metadata": {
-                        "chunk_kind": "spreadsheet_range",
-                        "sheet_name": sheet_name,
-                        "row_start": chunk_start,
-                        "row_end": max_row,
-                        "column_start": "A",
-                        "column_end": column_end,
-                    },
-                })
+            else:
+                text_parts.append(f"EMPTY: no populated cells (HIDDEN: {hidden})")
             text_parts.append("")
             if truncated:
                 break
@@ -1212,51 +1265,76 @@ class DocprocEngine:
         truncated = False
         for sheet_name in workbook.sheet_names[: self.config.max_sheets]:
             rows = workbook.get_sheet_by_name(sheet_name).to_python(skip_empty_area=False)
-            row_count = len(rows)
-            column_count = max((len(row) for row in rows), default=0)
-            column_end = get_column_letter(column_count) if column_count else "A"
+            physical_row_count = len(rows)
+            physical_column_count = max((len(row) for row in rows), default=0)
             sheet_cells = []
-            sheets.append({
+            sheet_info = {
                 "name": sheet_name,
-                "row_count": row_count,
-                "column_count": column_count,
+                "row_count": 0,
+                "column_count": 0,
+                "physical_row_count": physical_row_count,
+                "physical_column_count": physical_column_count,
+                "populated_row_count": 0,
                 "column_start": "A",
-                "column_end": column_end,
+                "column_end": "A",
                 "hidden": None,
                 "merged_ranges": [],
                 "cells": sheet_cells,
-            })
+            }
+            sheets.append(sheet_info)
             text_parts.append(f"## SHEET: {sheet_name}")
-            text_parts.append(f"ROWS: {row_count} COLUMNS: {column_count}")
-            rendered_rows = []
+            populated_rows: list[tuple[int, int, int, str]] = []
             for row_index, row in enumerate(rows, start=1):
-                values = []
+                rendered_cells = []
+                populated_columns = []
                 for col_index, value in enumerate(row, start=1):
-                    values.append("" if value is None else str(value))
-                    if value is not None:
-                        nonempty_cells += 1
-                        if nonempty_cells > self.config.max_nonempty_cells:
-                            truncated = True
-                            break
-                        sheet_cells.append({"coordinate": f"{get_column_letter(col_index)}{row_index}", "value": value})
-                rendered_rows.append(f"{row_index}\t" + "\t".join(values))
+                    if not self._spreadsheet_value_present(value):
+                        continue
+                    nonempty_cells += 1
+                    if nonempty_cells > self.config.max_nonempty_cells:
+                        truncated = True
+                        break
+                    coordinate = f"{get_column_letter(col_index)}{row_index}"
+                    sheet_cells.append({"coordinate": coordinate, "value": value})
+                    rendered_cells.append(
+                        f"{coordinate}={self._normalize_spreadsheet_text_value(value)}"
+                    )
+                    populated_columns.append(col_index)
                 if truncated:
                     break
-            for start in range(0, len(rendered_rows), chunk_rows):
-                end = min(start + chunk_rows, len(rendered_rows))
-                chunk_text = "\n".join(rendered_rows[start:end])
-                chunks.append({
-                    "text": chunk_text,
-                    "metadata": {
-                        "chunk_kind": "spreadsheet_range",
-                        "sheet_name": sheet_name,
-                        "row_start": start + 1,
-                        "row_end": end,
-                        "column_start": "A",
-                        "column_end": column_end,
-                    },
-                })
-                text_parts.append(chunk_text)
+                if rendered_cells:
+                    populated_rows.append((
+                        row_index,
+                        min(populated_columns),
+                        max(populated_columns),
+                        " | ".join(rendered_cells),
+                    ))
+            if populated_rows:
+                sheet_info["row_count"] = populated_rows[-1][0]
+                sheet_info["column_count"] = max(row[2] for row in populated_rows)
+                sheet_info["column_end"] = get_column_letter(sheet_info["column_count"])
+                sheet_info["populated_row_count"] = len(populated_rows)
+                text_parts.append(
+                    f"POPULATED ROWS: {len(populated_rows)} "
+                    f"RANGE: A1:{sheet_info['column_end']}{sheet_info['row_count']}"
+                )
+                for start in range(0, len(populated_rows), chunk_rows):
+                    batch = populated_rows[start:start + chunk_rows]
+                    chunk_text = "\n".join(row[3] for row in batch)
+                    chunks.append({
+                        "text": chunk_text,
+                        "metadata": {
+                            "chunk_kind": "spreadsheet_cells",
+                            "sheet_name": sheet_name,
+                            "row_start": batch[0][0],
+                            "row_end": batch[-1][0],
+                            "column_start": get_column_letter(min(row[1] for row in batch)),
+                            "column_end": get_column_letter(max(row[2] for row in batch)),
+                        },
+                    })
+                    text_parts.append(chunk_text)
+            else:
+                text_parts.append("EMPTY: no populated cells")
             text_parts.append("")
             if truncated:
                 break
@@ -1285,7 +1363,7 @@ class DocprocEngine:
                 "route": "spreadsheet_structured",
                 "content_sha256": digest,
                 "sheet_count": len(sheets),
-                "sheets": sheets,
+                "sheet_names": [sheet["name"] for sheet in sheets],
                 "spreadsheet_chunk_count": len(chunks),
                 "rendered_sheet_count": 0,
                 "reader": "python-calamine",
@@ -1353,6 +1431,42 @@ class DocprocEngine:
                 return f"{raw_value} => {cached_value}"
             return raw_value
         return str(raw_value if raw_value is not None else cached_value)
+
+    @staticmethod
+    def _spreadsheet_value_present(value: Any) -> bool:
+        """Keep meaningful falsey values while dropping empty/whitespace-only cells."""
+        if value is None:
+            return False
+        if isinstance(value, str):
+            return bool(value.strip())
+        return True
+
+    @staticmethod
+    def _normalize_spreadsheet_text_value(value: Any) -> str:
+        """Compact display whitespace without changing the structured cell value."""
+        text = str(value if value is not None else "")
+        lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.splitlines()]
+        return " ⏎ ".join(line for line in lines if line).strip()
+
+    @classmethod
+    def _render_spreadsheet_cell(
+        cls,
+        *,
+        coordinate: str,
+        raw_value: Any,
+        cached_value: Any,
+        hyperlink: Any = None,
+        comment: Any = None,
+    ) -> str:
+        rendered_value = cls._normalize_spreadsheet_text_value(
+            cls._format_cell_value(raw_value, cached_value)
+        )
+        rendered = f"{coordinate}={rendered_value}"
+        if hyperlink:
+            rendered += f" [link: {cls._normalize_spreadsheet_text_value(hyperlink)}]"
+        if comment:
+            rendered += f" [comment: {cls._normalize_spreadsheet_text_value(comment)}]"
+        return rendered
 
     @staticmethod
     def _build_result(*, raw_text: str, normalized_text: str, quality_flags: list[str], render_metadata: dict = None, structured_data: dict = None, transcription_status="complete", error=None) -> dict:
