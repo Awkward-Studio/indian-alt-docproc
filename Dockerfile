@@ -8,6 +8,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libreoffice-writer \
     libreoffice-calc \
     libreoffice-impress \
+    tesseract-ocr \
+    tesseract-ocr-eng \
     fonts-dejavu-core \
     default-jre-headless \
     && rm -rf /var/lib/apt/lists/*

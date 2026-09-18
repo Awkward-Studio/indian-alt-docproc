@@ -4,7 +4,7 @@ This is a standalone CPU-only FastAPI service. The production profile runs one w
 
 It is responsible for:
 - file-type-aware rendering and extraction
-- native text extraction from PDFs (image-only PDFs require a separate OCR deployment)
+- page-aware PDF extraction that keeps native text and uses local CPU OCR for pages without a text layer
 - richer Office processing for DOCX/PPTX/XLSX
 - native Outlook `.msg` email extraction
 - text-only normalization through a separate text model after extraction
@@ -28,6 +28,9 @@ It is responsible for:
 - `DOCPROC_RENDER_PPTX`
 - `DOCPROC_RENDER_XLSX`
 - `DOCPROC_NORMALIZE_WITH_MODEL` (defaults to `false`; keep it disabled on the T4)
+- `DOCPROC_LOCAL_OCR_ENABLED` (defaults to `true`; OCRs PDF pages missing a text layer with Tesseract)
+- `DOCPROC_LOCAL_OCR_LANGUAGE` (defaults to `eng`)
+- `DOCPROC_LOCAL_OCR_DPI` (defaults to `200`)
 - `DOCPROC_MAX_FILE_BYTES`
 
 ## Local Run
@@ -90,11 +93,11 @@ Response JSON:
 ```
 
 Notes:
-- `docproc` sends rendered pages to `VLLM_OCR_BASE_URL` and normalization to `VLLM_BASE_URL`.
+- When a dedicated OCR model is configured, `docproc` sends only PDF pages without native text to `VLLM_OCR_BASE_URL`. Otherwise it OCRs those pages locally with Tesseract. Text normalization uses `VLLM_BASE_URL` when enabled.
 - The H100 profile uses `baidu/Unlimited-OCR` for page OCR and `Qwen/Qwen3.8-27B` for text normalization and downstream analysis.
 - `DOCPROC_MAX_CONCURRENT_OCR` limits concurrent OCR page requests. Text normalization uses the independent text server.
 - Native readers preserve Office, spreadsheet, and email text exactly. Model normalization is opt-in and disabled in the T4 profile so extraction cannot block report inference.
-- Standalone images are not accepted in the T4 profile. Image-only PDFs fail explicitly with `dedicated_ocr_required`; no shared text-model vision fallback is attempted.
+- Standalone images are not accepted in the T4 profile. Image-only and mixed PDFs use local Tesseract OCR; no shared text-model vision fallback is attempted.
 - Unlimited-OCR requests include its required `<image>` prefix, no-repeat n-gram arguments, and special-token cleanup.
 - If you want LibreOffice rendering for `DOCX` or `XLSX`, set `DOCPROC_RENDER_DOCX=true` or `DOCPROC_RENDER_XLSX=true`.
 - Outlook `.msg` files are parsed natively with `extract-msg`. Supported nested attachments are recursively extracted with depth, count, byte, and digest limits.

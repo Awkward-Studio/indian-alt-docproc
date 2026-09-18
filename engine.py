@@ -50,6 +50,9 @@ class EngineConfig:
     normalization_chunk_chars: int = 12000
     ocr_max_tokens: int = 8192
     normalize_with_model: bool = False
+    local_ocr_enabled: bool = True
+    local_ocr_language: str = "eng"
+    local_ocr_dpi: int = 200
     max_nonempty_cells: int = 1_000_000
     max_sheets: int = 250
     max_extracted_chars: int = 20_000_000
@@ -144,7 +147,13 @@ class DocprocEngine:
         logger.info(f"--- START EXTRACTION: {filename} (Ext: {ext}) ---")
         try:
             if ext == ".pdf":
-                native = self._extract_pdf_native(file_content, page_limit=limit, filename=filename)
+                native = self._extract_pdf_native(
+                    file_content,
+                    page_limit=limit,
+                    filename=filename,
+                    hint=hint,
+                    prompt=prompt,
+                )
                 if native:
                     logger.info(f"[{filename}] SUCCESS: Returning native PDF text.")
                     return native
@@ -286,29 +295,116 @@ class DocprocEngine:
         ocr_url = (self.config.ocr_base_url or self.config.vllm_base_url).rstrip("/")
         return text_url == ocr_url
 
-    def _extract_pdf_native(self, file_content: bytes, *, page_limit: int | None, filename: str) -> dict[str, Any] | None:
-        sections = []
-        empty_pages = []
+    def _dedicated_ocr_available(self) -> bool:
+        return bool(
+            self.config.ocr_base_url
+            and self.config.ocr_model
+            and not self._uses_shared_text_endpoint_for_ocr()
+        )
+
+    def _local_ocr_available(self) -> bool:
+        return bool(self.config.local_ocr_enabled and shutil.which("tesseract"))
+
+    def _local_ocr_page(self, page: fitz.Page) -> str:
+        text_page = page.get_textpage_ocr(
+            language=self.config.local_ocr_language,
+            dpi=max(72, self.config.local_ocr_dpi),
+            full=True,
+        )
+        return page.get_text("text", textpage=text_page).strip()
+
+    def _extract_pdf_native(
+        self,
+        file_content: bytes,
+        *,
+        page_limit: int | None,
+        filename: str,
+        hint: str | None = None,
+        prompt: str | None = None,
+    ) -> dict[str, Any] | None:
+        page_text: list[str] = []
+        native_pages: list[int] = []
+        missing_pages: list[int] = []
+        ocr_pages: list[int] = []
+        ocr_errors: dict[str, str] = {}
+        ocr_engine = None
         with fitz.open(stream=file_content, filetype="pdf") as document:
             limit = min(page_limit, len(document)) if page_limit else len(document)
             for index in range(limit):
                 text = document[index].get_text().strip()
-                if text:
-                    sections.append(f"--- {filename} (PAGE {index + 1}) ---\n{text}")
+                if self._has_meaningful_text(text):
+                    page_text.append(text)
+                    native_pages.append(index + 1)
                 else:
-                    empty_pages.append(index + 1)
+                    page_text.append("")
+                    missing_pages.append(index + 1)
+
+            if missing_pages and self._dedicated_ocr_available():
+                ocr_engine = "dedicated_model"
+                for page_number in missing_pages:
+                    try:
+                        page = document[page_number - 1]
+                        pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
+                        try:
+                            encoded = self._optimize_and_encode(pix.tobytes("png"))
+                        finally:
+                            del pix
+                        text = self._clean_model_text(self._multimodal_transcribe_page(
+                            encoded,
+                            filename=filename,
+                            page_number=page_number,
+                            hint=hint,
+                            prompt=prompt,
+                        ))
+                        if self._has_meaningful_text(text):
+                            page_text[page_number - 1] = text
+                            ocr_pages.append(page_number)
+                    except Exception as exc:
+                        ocr_errors[str(page_number)] = str(exc)[:500]
+            elif missing_pages and self._local_ocr_available():
+                ocr_engine = "tesseract"
+                for page_number in missing_pages:
+                    try:
+                        text = self._local_ocr_page(document[page_number - 1])
+                        if self._has_meaningful_text(text):
+                            page_text[page_number - 1] = text
+                            ocr_pages.append(page_number)
+                    except Exception as exc:
+                        ocr_errors[str(page_number)] = str(exc)[:500]
+
+        sections = [
+            f"--- {filename} (PAGE {index + 1}) ---\n{text}"
+            for index, text in enumerate(page_text)
+            if self._has_meaningful_text(text)
+        ]
+        unreadable_pages = [
+            index + 1 for index, text in enumerate(page_text)
+            if not self._has_meaningful_text(text)
+        ]
         full_text = "\n\n".join(sections).strip()
         if not self._has_meaningful_text(full_text):
             return None
         flags = ["direct_text", "pdf_native", "no_render"]
-        if empty_pages:
-            flags.append(f"Pages without native text were not interpreted: {','.join(map(str, empty_pages))}")
+        if ocr_pages:
+            flags.extend(["hybrid_pdf_extraction", f"ocr_{ocr_engine}"])
+        if unreadable_pages:
+            flags.append(
+                "Pages without readable text were not interpreted:"
+                + ",".join(map(str, unreadable_pages))
+            )
         return self._build_result(
             raw_text=full_text,
             normalized_text=full_text,
             quality_flags=flags,
-            transcription_status="partial" if empty_pages else "complete",
-            render_metadata={"native_text_pages": len(sections), "unreadable_pages": empty_pages},
+            transcription_status="partial" if unreadable_pages else "complete",
+            render_metadata={
+                "page_count": len(page_text),
+                "native_text_pages": native_pages,
+                "ocr_pages": ocr_pages,
+                "ocr_engine": ocr_engine,
+                "unreadable_pages": unreadable_pages,
+                "ocr_errors": ocr_errors,
+            },
         )
 
     def _extract_via_multimodal(self, *, file_content: bytes, filename: str, page_limit: int | None, hint: str | None = None, prompt: str | None = None) -> dict[str, Any]:

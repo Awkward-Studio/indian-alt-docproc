@@ -44,6 +44,9 @@ def get_engine():
         normalization_chunk_chars=int(os.getenv("DOCPROC_NORMALIZATION_CHUNK_CHARS", "12000")),
         ocr_max_tokens=int(os.getenv("DOCPROC_OCR_MAX_TOKENS", "8192")),
         normalize_with_model=os.getenv("DOCPROC_NORMALIZE_WITH_MODEL", "false").lower() == "true",
+        local_ocr_enabled=os.getenv("DOCPROC_LOCAL_OCR_ENABLED", "true").lower() == "true",
+        local_ocr_language=os.getenv("DOCPROC_LOCAL_OCR_LANGUAGE", "eng"),
+        local_ocr_dpi=int(os.getenv("DOCPROC_LOCAL_OCR_DPI", "200")),
         max_nonempty_cells=int(os.getenv("DOCPROC_MAX_NONEMPTY_CELLS", "1000000")),
         max_sheets=int(os.getenv("DOCPROC_MAX_SHEETS", "250")),
         max_extracted_chars=int(os.getenv("DOCPROC_MAX_EXTRACTED_CHARS", "20000000")),
@@ -67,7 +70,9 @@ def health():
             "max_concurrent_model_requests": engine.config.max_concurrent_ocr,
             "extraction_workers": 1,
             "normalization_enabled": engine.config.normalize_with_model,
-            "ocr_available": bool(engine.config.ocr_base_url and engine.config.ocr_model and not engine._uses_shared_text_endpoint_for_ocr()),
+            "ocr_available": engine._dedicated_ocr_available() or engine._local_ocr_available(),
+            "dedicated_ocr_available": engine._dedicated_ocr_available(),
+            "local_ocr_available": engine._local_ocr_available(),
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -79,7 +84,9 @@ def capabilities():
         "schema_version": "2",
         "supported_extensions": sorted(engine.SUPPORTED_EXTENSIONS),
         "max_file_bytes": int(os.getenv("DOCPROC_MAX_FILE_BYTES", str(25 * 1024 * 1024))),
-        "ocr_available": bool(engine.config.ocr_base_url and engine.config.ocr_model and not engine._uses_shared_text_endpoint_for_ocr()),
+        "ocr_available": engine._dedicated_ocr_available() or engine._local_ocr_available(),
+        "dedicated_ocr_available": engine._dedicated_ocr_available(),
+        "local_ocr_available": engine._local_ocr_available(),
         "spreadsheet_readers": {"ooxml": "openpyxl", "legacy_and_binary": "python-calamine", "recovery": "libreoffice"},
     }
 

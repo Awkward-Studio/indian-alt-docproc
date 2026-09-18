@@ -122,6 +122,55 @@ class DocprocEngineModelTests(unittest.TestCase):
         self.assertIn("pdf_native", result["quality_flags"])
         self.engine._extract_via_multimodal.assert_not_called()
 
+    @patch.object(DocprocEngine, "_local_ocr_available", return_value=True)
+    @patch.object(DocprocEngine, "_local_ocr_page", return_value="OCR-only market share evidence")
+    def test_pdf_merges_native_text_with_local_ocr_for_missing_pages(self, local_ocr, _available):
+        engine = DocprocEngine(EngineConfig(
+            vllm_base_url="http://gemma:8000/v1",
+            vllm_api_key="test-key",
+            text_model="gemma-4-12b-it-q8",
+            ocr_base_url="http://gemma:8000/v1",
+            ocr_model="gemma-4-12b-it-q8",
+        ))
+        document = fitz.open()
+        first = document.new_page()
+        first.insert_text((72, 72), "Native financial evidence")
+        document.new_page()
+        content = document.tobytes()
+        document.close()
+
+        result = engine._extract_document_raw(file_content=content, filename="mixed.pdf")
+
+        self.assertEqual(result["transcription_status"], "complete")
+        self.assertIn("Native financial evidence", result["normalized_text"])
+        self.assertIn("OCR-only market share evidence", result["normalized_text"])
+        self.assertEqual(result["render_metadata"]["native_text_pages"], [1])
+        self.assertEqual(result["render_metadata"]["ocr_pages"], [2])
+        self.assertEqual(result["render_metadata"]["unreadable_pages"], [])
+        self.assertIn("ocr_tesseract", result["quality_flags"])
+        local_ocr.assert_called_once()
+
+    @patch.object(DocprocEngine, "_local_ocr_available", return_value=False)
+    def test_pdf_without_ocr_keeps_partial_status_and_names_missing_pages(self, _available):
+        engine = DocprocEngine(EngineConfig(
+            vllm_base_url="http://gemma:8000/v1",
+            vllm_api_key="test-key",
+            text_model="gemma-4-12b-it-q8",
+            ocr_base_url="http://gemma:8000/v1",
+            ocr_model="gemma-4-12b-it-q8",
+        ))
+        document = fitz.open()
+        first = document.new_page()
+        first.insert_text((72, 72), "Native financial evidence")
+        document.new_page()
+        content = document.tobytes()
+        document.close()
+
+        result = engine._extract_document_raw(file_content=content, filename="mixed.pdf")
+
+        self.assertEqual(result["transcription_status"], "partial")
+        self.assertEqual(result["render_metadata"]["unreadable_pages"], [2])
+
     def test_image_only_pdf_is_not_sent_to_shared_text_server(self):
         engine = DocprocEngine(EngineConfig(
             vllm_base_url="http://gemma:8000/v1",
