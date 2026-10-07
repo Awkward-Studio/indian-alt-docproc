@@ -1,0 +1,4 @@
+FROM vllm/vllm-openai:v0.17.0
+
+# GLM-OCR requires Transformers 5; the stock vLLM image carries an older build.
+RUN python3 -m pip install --no-cache-dir "transformers==5.3.0"

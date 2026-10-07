@@ -256,6 +256,42 @@ class DocprocEngineModelTests(unittest.TestCase):
         self.assertIn("formulas_present", result["quality_flags"])
         self.assertNotIn("sheets", result["render_metadata"])
 
+    def test_array_formulas_and_defined_names_are_machine_readable(self):
+        from openpyxl.worksheet.formula import ArrayFormula
+        from openpyxl.workbook.defined_name import DefinedName
+
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "Model"
+        sheet["A1"] = 5
+        sheet["B1"] = ArrayFormula(ref="B1:B2", text="=A1:A2*2")
+        workbook.defined_names.add(DefinedName("GrowthRate", attr_text="Model!$A$1"))
+        payload = io.BytesIO()
+        workbook.save(payload)
+        result = self.engine._extract_openpyxl_complete(payload.getvalue(), "array.xlsx")
+        manifest = result["structured_data"]
+        formula = next(c for c in manifest["sheets"][0]["cells"] if c["coordinate"] == "B1")
+        self.assertEqual(formula["value"], "=A1:A2*2")
+        self.assertEqual(formula["formula_metadata"]["ref"], "B1:B2")
+        self.assertEqual(manifest["workbook"]["defined_names"][0]["name"], "GrowthRate")
+        self.assertEqual(manifest["workbook"]["defined_names"][0]["attr_text"], "Model!$A$1")
+        self.assertIn("not recalculated", manifest["workbook"]["cached_value_provenance"])
+
+    def test_legacy_workbook_prefers_formula_preserving_conversion(self):
+        with patch.object(self.engine, "_extract_legacy_spreadsheet_via_libreoffice", return_value={
+            "quality_flags": [], "structured_data": {"sheets": []},
+        }) as convert, patch.object(self.engine, "_extract_calamine_spreadsheet_complete") as values:
+            result = self.engine._extract_spreadsheet_complete(b"legacy", "model.xlsb")
+        convert.assert_called_once()
+        values.assert_not_called()
+        self.assertIn("LibreOffice conversion", result["structured_data"]["workbook"]["cached_value_provenance"])
+
+    def test_values_only_fallback_discloses_formula_fidelity_loss(self):
+        with patch.object(self.engine, "_extract_legacy_spreadsheet_via_libreoffice", return_value=None), \
+             patch.object(self.engine, "_extract_calamine_spreadsheet_complete", return_value={"quality_flags": [], "structured_data": {}}):
+            result = self.engine._extract_spreadsheet_complete(b"legacy", "model.xls")
+        self.assertIn("formula_fidelity_unavailable_values_only", result["quality_flags"])
+
     def test_xlsx_normalized_text_omits_blank_cells_and_rows_but_names_empty_sheets(self):
         workbook = Workbook()
         sheet = workbook.active

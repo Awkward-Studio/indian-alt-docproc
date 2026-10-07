@@ -1029,7 +1029,22 @@ class DocprocEngine:
                 return self._extract_csv_complete(file_content, filename=filename)
             if ext in {".xlsx", ".xlsm", ".xltx", ".xltm"}:
                 return self._extract_openpyxl_complete(file_content, filename=filename)
-            return self._extract_calamine_spreadsheet_complete(file_content, filename=filename)
+            if ext in {".xls", ".xlsb", ".xla", ".xlam", ".ods"}:
+                recovered = self._extract_legacy_spreadsheet_via_libreoffice(
+                    file_content, filename=filename,
+                    original_error=ValueError("Value-only legacy reader cannot preserve formulas"),
+                )
+                if recovered:
+                    recovered.setdefault("structured_data", {}).setdefault("workbook", {})[
+                        "cached_value_provenance"
+                    ] = "LibreOffice conversion; results may differ from the original Excel cache"
+                    return recovered
+            result = self._extract_calamine_spreadsheet_complete(file_content, filename=filename)
+            result["quality_flags"].append("formula_fidelity_unavailable_values_only")
+            result.setdefault("structured_data", {}).setdefault("workbook", {})[
+                "formula_fidelity"
+            ] = "unavailable_values_only"
+            return result
         except Exception as exc:
             logger.warning(f"[{filename}] Structured spreadsheet reader failed: {exc}")
             if ext in {".xls", ".xlsb", ".xla", ".xlam", ".ods"}:
@@ -1219,6 +1234,18 @@ class DocprocEngine:
                     formula_cell = formula_row[col_index - 1] if col_index <= len(formula_row) else None
                     cached_value = value_row[col_index - 1] if col_index <= len(value_row) else None
                     raw_value = formula_cell.value if formula_cell is not None else None
+                    formula_metadata = None
+                    # Array/dynamic formulas are objects in recent openpyxl.
+                    # Preserve their expression, range and data-table metadata,
+                    # rather than serializing an opaque Python object repr.
+                    if formula_cell is not None and formula_cell.data_type == "f" and not isinstance(raw_value, str):
+                        formula_metadata = {
+                            "kind": type(raw_value).__name__,
+                            **{k: getattr(raw_value, k) for k in ("ref", "r1", "r2", "dt2D", "dtr", "del1", "del2")
+                               if getattr(raw_value, k, None) is not None},
+                        }
+                        expression = getattr(raw_value, "text", None)
+                        raw_value = expression or "=DATA_TABLE_REQUIRES_EXCEL_EVALUATION()"
                     hyperlink = getattr(formula_cell, "hyperlink", None) if formula_cell is not None else None
                     comment = getattr(formula_cell, "comment", None) if formula_cell is not None else None
                     if (
@@ -1241,6 +1268,7 @@ class DocprocEngine:
                             "style_id": formula_cell.style_id,
                             "hyperlink": getattr(hyperlink, "target", None),
                             "comment": getattr(comment, "text", None),
+                            **({"formula_metadata": formula_metadata} if formula_metadata else {}),
                         })
                         rendered = self._render_spreadsheet_cell(
                             coordinate=coordinate,
@@ -1297,7 +1325,12 @@ class DocprocEngine:
         sheet_order = list(formula_wb.sheetnames)
         workbook_metadata = {
             "sheet_order": sheet_order,
-            "defined_names": [str(item) for item in formula_wb.defined_names.values()],
+            "defined_names": [
+                {"name": item.name, "attr_text": item.attr_text,
+                 "localSheetId": item.localSheetId, "hidden": item.hidden}
+                for item in formula_wb.defined_names.values()
+            ],
+            "cached_value_provenance": "Saved Excel workbook cache; not recalculated during extraction",
             "calculation": str(getattr(formula_wb, "calculation", "")),
             "properties": {
                 "title": formula_wb.properties.title,

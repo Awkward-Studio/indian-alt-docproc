@@ -1,0 +1,69 @@
+services:
+  glm-ocr:
+    build:
+      context: .
+      dockerfile: Dockerfile.ocr.h100
+    image: india-alt-glm-ocr:h100
+    container_name: glm-ocr-h100
+    restart: unless-stopped
+    runtime: nvidia
+    ipc: host
+    ports:
+      - "127.0.0.1:8003:8003"
+    volumes:
+      - /mnt/vllm-cache/huggingface:/root/.cache/huggingface
+    command:
+      - --model
+      - zai-org/GLM-OCR
+      - --served-model-name
+      - zai-org/GLM-OCR
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8003"
+      - --api-key
+      - ${VLLM_API_KEY:?Set the private H100 API key}
+      - --gpu-memory-utilization
+      - "0.06"
+      - --max-model-len
+      - "32768"
+      - --max-num-seqs
+      - "1"
+      - --enforce-eager
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8003/health', timeout=5).read()"]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 120s
+  docproc:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: india-alt-docproc:h100
+    container_name: docproc-h100
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - docproc.h100.env
+    environment:
+      DOCPROC_NORMALIZE_WITH_MODEL: "false"
+      DOCPROC_MAX_CONCURRENT_OCR: "1"
+      DOCPROC_LOCAL_OCR_ENABLED: "false"
+      VLLM_OCR_BASE_URL: "http://127.0.0.1:8003/v1"
+      VLLM_OCR_MODEL: "zai-org/GLM-OCR"
+    depends_on:
+      glm-ocr:
+        condition: service_healthy
+    # Preserve structured Office cells/formulas; use GLM-OCR for visual pages.
+    command: >
+      uvicorn main:app --host 127.0.0.1 --port 8100 --workers 1
+      --h11-max-incomplete-event-size 524288000 --timeout-keep-alive 600
+      --timeout-graceful-shutdown 600
+    mem_limit: 8g
+    cpus: 2.0
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/health', timeout=5).read()"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
