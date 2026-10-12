@@ -21,6 +21,7 @@ class ExtractDocumentRequest(BaseModel):
     content_base64: str
     page_limit: int | None = None
     start_page: int | None = 0
+    cursor: dict | None = None
     hint: str | None = None
     prompt: str | None = None
 
@@ -169,3 +170,55 @@ async def extract_document_v2(
         ),
         media_type="application/x-ndjson",
     )
+
+
+@app.post("/v3/extract/spreadsheet-batch")
+async def extract_spreadsheet_batch(request: ExtractDocumentRequest, authorization: str | None = Header(default=None)):
+    _authorize(authorization)
+    try:
+        content = base64.b64decode(request.content_base64, validate=True)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base64")
+    _validate_file(content, request.filename)
+    if os.path.splitext(request.filename)[1].lower() not in {'.xlsx', '.xlsm', '.xltx', '.xltm'}:
+        raise HTTPException(status_code=400, detail="Batch extraction requires an OOXML spreadsheet")
+    engine = get_engine()
+    # Reuse the bounded extraction worker rather than blocking FastAPI's event loop.
+    from starlette.concurrency import run_in_threadpool
+    def extract():
+        with engine._extraction_semaphore:
+            return engine._extract_openpyxl_complete(content, request.filename, cursor=request.cursor)
+    try:
+        return await run_in_threadpool(extract)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+
+
+@app.post("/v3/extract/pdf-page")
+async def extract_pdf_page(request: ExtractDocumentRequest, authorization: str | None = Header(default=None)):
+    _authorize(authorization)
+    try:
+        content = base64.b64decode(request.content_base64, validate=True)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base64")
+    _validate_file(content, request.filename)
+    if os.path.splitext(request.filename)[1].lower() != '.pdf':
+        raise HTTPException(status_code=400, detail="Expected PDF")
+    from starlette.concurrency import run_in_threadpool
+    import fitz, hashlib
+    engine = get_engine()
+    def extract():
+        with engine._extraction_semaphore, fitz.open(stream=content, filetype='pdf') as source:
+            index = request.start_page or 0
+            if index < 0 or index >= len(source): raise ValueError('Page is outside source document')
+            with fitz.open() as single:
+                single.insert_pdf(source, from_page=index, to_page=index)
+                result = engine.extract_document(file_content=single.tobytes(), filename=request.filename, page_limit=1, hint=request.hint, prompt=request.prompt)
+            manifest = result.get('structured_data') or {}
+            for page in manifest.get('pages', []): page['page'] = index + 1
+            result['structured_data'] = {**manifest, 'kind': 'document_pages', 'content_sha256': hashlib.sha256(content).hexdigest(), 'total_page_count':len(source)}
+            for key in ['raw_extracted_text','normalized_text']:
+                result[key] = str(result.get(key) or '').replace('(PAGE 1)', '(PAGE %s)' % (index + 1))
+            return result
+    try: return await run_in_threadpool(extract)
+    except ValueError as error: raise HTTPException(status_code=400, detail=str(error))

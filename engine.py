@@ -328,13 +328,19 @@ class DocprocEngine:
         ocr_pages: list[int] = []
         ocr_errors: dict[str, str] = {}
         ocr_engine = None
+        native_tables = {}
         with fitz.open(stream=file_content, filetype="pdf") as document:
-            limit = min(page_limit, len(document)) if page_limit else len(document)
+            total_pages = len(document)
+            limit = min(page_limit, total_pages) if page_limit else total_pages
             for index in range(limit):
                 text = document[index].get_text().strip()
                 if self._has_meaningful_text(text):
                     page_text.append(text)
                     native_pages.append(index + 1)
+                    try:
+                        native_tables[index + 1] = [table.extract() for table in document[index].find_tables().tables]
+                    except Exception:
+                        native_tables[index + 1] = []
                 else:
                     page_text.append("")
                     missing_pages.append(index + 1)
@@ -396,9 +402,16 @@ class DocprocEngine:
             raw_text=full_text,
             normalized_text=full_text,
             quality_flags=flags,
-            transcription_status="partial" if unreadable_pages else "complete",
+            transcription_status="partial" if unreadable_pages or limit < total_pages else "complete",
+            structured_data={'schema_version': '3', 'kind': 'document_pages', 'content_sha256': hashlib.sha256(file_content).hexdigest(),
+                'total_page_count': total_pages, 'pages': [{'page': index + 1, 'text': text,
+                    'tables': native_tables.get(index + 1, []), 'provenance': 'ocr' if index + 1 in ocr_pages else 'native_text',
+                    'status': 'complete' if self._has_meaningful_text(text) else 'unreadable'} for index,text in enumerate(page_text)],
+                'pending_pages': list(range(limit + 1, total_pages + 1)), 'truncated': bool(unreadable_pages or limit < total_pages)},
             render_metadata={
                 "page_count": len(page_text),
+                "total_page_count": total_pages,
+                "pending_pages": list(range(limit + 1, total_pages + 1)),
                 "native_text_pages": native_pages,
                 "ocr_pages": ocr_pages,
                 "ocr_engine": ocr_engine,
@@ -1155,7 +1168,7 @@ class DocprocEngine:
             "structured_data": structured_data,
         }
 
-    def _extract_openpyxl_complete(self, file_content: bytes, filename: str = "") -> dict[str, Any]:
+    def _extract_openpyxl_complete(self, file_content: bytes, filename: str = "", cursor: dict | None = None) -> dict[str, Any]:
         ext = os.path.splitext(filename)[1].lower()
         digest = hashlib.sha256(file_content).hexdigest()
         keep_vba = ext in {".xlsm", ".xltm"}
@@ -1168,6 +1181,12 @@ class DocprocEngine:
         flags = ["spreadsheet_structured", "raw_complete", "artifact_backed"]
         nonempty_cells = 0
         truncated = False
+        next_cursor = None
+        start_sheet = int((cursor or {}).get('sheet', 0))
+        start_row = int((cursor or {}).get('row', 1))
+        start_column = int((cursor or {}).get('column', 1))
+        if start_sheet < 0 or start_row < 1 or start_column < 1:
+            raise ValueError('Invalid spreadsheet extraction cursor')
 
         macro_metadata = {"present": False}
         if keep_vba:
@@ -1182,7 +1201,13 @@ class DocprocEngine:
                     }
                     flags.append("macros_present_metadata_only")
 
-        for sheet_name in formula_wb.sheetnames[: self.config.max_sheets]:
+        for sheet_index, sheet_name in enumerate(formula_wb.sheetnames):
+            if sheet_index < start_sheet:
+                continue
+            if len(sheets) >= self.config.max_sheets:
+                truncated = True
+                next_cursor = {'sheet': sheet_index, 'row': 1, 'column': 1}
+                break
             ws_formula = formula_wb[sheet_name]
             ws_value = value_wb[sheet_name]
             physical_max_row = ws_formula.max_row or 0
@@ -1231,6 +1256,8 @@ class DocprocEngine:
                 rendered_cells = []
                 row_columns = []
                 for col_index in range(1, physical_max_col + 1):
+                    if sheet_index == start_sheet and (row_index, col_index) < (start_row, start_column):
+                        continue
                     formula_cell = formula_row[col_index - 1] if col_index <= len(formula_row) else None
                     cached_value = value_row[col_index - 1] if col_index <= len(value_row) else None
                     raw_value = formula_cell.value if formula_cell is not None else None
@@ -1257,6 +1284,7 @@ class DocprocEngine:
                         nonempty_cells += 1
                         if nonempty_cells > self.config.max_nonempty_cells:
                             truncated = True
+                            next_cursor = {'sheet': sheet_index, 'row': row_index, 'column': col_index}
                             break
                         coordinate = formula_cell.coordinate
                         sheet_info["cells"].append({
@@ -1281,8 +1309,6 @@ class DocprocEngine:
                         row_columns.append(col_index)
                     if isinstance(raw_value, str) and raw_value.startswith("=") and "formulas_present" not in flags:
                         flags.append("formulas_present")
-                if truncated:
-                    break
                 if rendered_cells:
                     populated_rows.append((
                         row_index,
@@ -1290,6 +1316,8 @@ class DocprocEngine:
                         max(row_columns),
                         " | ".join(rendered_cells),
                     ))
+                if truncated:
+                    break
 
             if populated_rows:
                 sheet_info["row_count"] = populated_rows[-1][0]
@@ -1348,6 +1376,8 @@ class DocprocEngine:
         structured_data = {
             "schema_version": "2",
             "kind": "spreadsheet",
+            "next_cursor": next_cursor,
+            "cursor": cursor,
             "format": ext.lstrip("."),
             "filename": filename,
             "content_sha256": digest,
@@ -1360,9 +1390,7 @@ class DocprocEngine:
         normalized_text = "\n".join(text_parts).strip()
         if len(normalized_text) > self.config.max_extracted_chars:
             normalized_text = normalized_text[: self.config.max_extracted_chars]
-            structured_data["truncated"] = True
-            flags = [flag for flag in flags if flag != "raw_complete"]
-            flags.extend(["partial_extraction", "spreadsheet_text_limit_reached"])
+            flags.append("spreadsheet_text_preview_limit_reached")
         return {
             "raw_extracted_text": normalized_text,
             "normalized_text": normalized_text,

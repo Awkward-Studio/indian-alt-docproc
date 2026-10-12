@@ -350,3 +350,35 @@ class DocprocEngineModelTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SpreadsheetBatchTests(unittest.TestCase):
+    def test_batches_resume_mid_row_without_losing_zero_or_hidden_sheet(self):
+        workbook=Workbook();sheet=workbook.active;sheet.title='P&L'
+        sheet.append(['Metric','FY24','FY25']);sheet.append(['Revenue',0,123]);hidden=workbook.create_sheet('Hidden');hidden.sheet_state='hidden';hidden.append(['Cash',7])
+        stream=io.BytesIO();workbook.save(stream)
+        engine=DocprocEngine(EngineConfig(vllm_base_url='',vllm_api_key='',text_model='',max_nonempty_cells=2,max_sheets=1,max_extracted_chars=5))
+        cursor=None;found={};seen=[]
+        for _ in range(20):
+            batch=engine._extract_openpyxl_complete(stream.getvalue(),'model.xlsx',cursor=cursor)
+            manifest=batch['structured_data']
+            for item in manifest['sheets']:
+                for cell in item['cells']:
+                    key=(item['name'],cell['coordinate']);self.assertNotIn(key,found);found[key]=cell['value']
+            cursor=manifest['next_cursor']
+            if cursor is None:break
+            self.assertNotIn(cursor,seen);seen.append(cursor)
+        self.assertIsNone(cursor)
+        self.assertEqual(found[('P&L','B2')],0)
+        self.assertEqual(found[('Hidden','B1')],7)
+        self.assertEqual(len(found),8)
+
+    def test_pdf_page_limit_records_pending_pages(self):
+        doc=fitz.open()
+        for index in range(3):
+            page=doc.new_page();page.insert_text((72,72),'Financial statement source page %s with readable text.' % (index+1))
+        engine=DocprocEngine(EngineConfig(vllm_base_url='',vllm_api_key='',text_model=''))
+        result=engine._extract_pdf_native(doc.tobytes(),page_limit=1,filename='accounts.pdf')
+        self.assertEqual(result['transcription_status'],'partial')
+        self.assertEqual(result['structured_data']['pending_pages'],[2,3])
+        self.assertEqual(result['structured_data']['total_page_count'],3)
